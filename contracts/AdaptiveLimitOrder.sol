@@ -83,6 +83,14 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         address _slippageCalculator,
         address _limitOrderProtocol
     ) Ownable(msg.sender) {
+        require(
+            _slippageCalculator != address(0),
+            "Invalid slippage calculator"
+        );
+        require(
+            _limitOrderProtocol != address(0),
+            "Invalid limit order protocol"
+        );
         slippageCalculator = IDynamicSlippageCalculator(_slippageCalculator);
         limitOrderProtocol = I1inchLimitOrderProtocol(_limitOrderProtocol);
     }
@@ -282,9 +290,27 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
 
     function _submitToOneInch(uint256 orderId) internal {
         // TODO: Create and submit order to 1inch Limit Order Protocol
-        // - Build order struct with current slippage
-        // - Submit to protocol
-        // - Store returned order hash
+        // Current interface only supports fillOrder and cancelOrder
+        // Need to implement proper order submission logic based on 1inch SDK
+        Order storage order = orders[orderId];
+
+        // Generate deterministic unique order hash (like 1inch does)
+        order.orderHash = uint256(
+            keccak256(
+                abi.encode(
+                    orderId,
+                    order.maker,
+                    order.tokenIn,
+                    order.tokenOut,
+                    order.amountIn,
+                    order.basePrice,
+                    order.currentSlippage,
+                    address(this),
+                    block.chainid
+                )
+            )
+        );
+        oneInchOrderToLocal[bytes32(order.orderHash)] = orderId;
     }
 
     function _updateOneInchOrder(uint256 orderId) internal {
