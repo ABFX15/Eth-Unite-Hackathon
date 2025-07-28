@@ -1,0 +1,58 @@
+{
+  "name": "mev-proof-1inch",
+  "version": "1.0.0",
+  "description": "1inch Auto-Yield Payment Streams - ETH Unite Hackathon Project",
+  "main": "index.js",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy": "hardhat run scripts/deploy.ts",
+    "deploy:sepolia": "hardhat run scripts/deploy.ts --network sepolia",
+    "deploy:polygon": "hardhat run scripts/deploy.ts --network polygon",
+    "deploy:arbitrum": "hardhat run scripts/deploy.ts --network arbitrum",
+    "deploy:etherlink": "hardhat run scripts/deploy.ts --network etherlink",
+    "test-flow": "hardhat run scripts/test-flow.ts",
+    "verify": "hardhat verify",
+    "node": "hardhat node",
+    "frontend:dev": "cd frontend && npm run dev",
+    "frontend:build": "cd frontend && npm run build",
+    "frontend:install": "cd frontend && npm install",
+    "dev": "concurrently \"npm run node\" \"npm run frontend:dev\"",
+    "clean": "hardhat clean && rm -rf cache artifacts"
+  },
+  "keywords": [
+    "1inch",
+    "defi",
+    "hackathon",
+    "yield",
+    "mev",
+    "twap",
+    "fusion"
+  ],
+  "author": "ETH Unite Hackathon Team",
+  "license": "MIT",
+  "type": "commonjs",
+  "devDependencies": {
+    "@1inch/limit-order-protocol": "^2.0.5",
+    "@1inch/solidity-utils": "^6.6.0",
+    "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "@nomicfoundation/hardhat-verify": "^2.1.0",
+    "@openzeppelin/contracts": "^5.4.0",
+    "@typechain/ethers-v6": "^0.5.1",
+    "@typechain/hardhat": "^9.1.0",
+    "concurrently": "^8.2.2",
+    "ethers": "^6.15.0",
+    "hardhat": "^2.26.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@1inch/cross-chain-sdk": "^0.2.1-rc.51",
+    "@1inch/fusion-sdk": "^2.3.5",
+    "@1inch/swap-sdk": "^2.0.0",
+    "@1inch/aggregation-protocol": "^5.2.0",
+    "@1inch/multicall": "^1.4.0",
+    "@1inch/permit-signed-approvals-utils": "^1.1.0",
+    "axios": "^1.6.2"
+  }
+}
