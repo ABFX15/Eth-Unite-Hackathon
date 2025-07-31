@@ -3,471 +3,460 @@ pragma solidity ^0.8.20;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
-interface IAdaptiveLimitOrder {
-    function getOrderPerformanceMetrics(
-        uint256 orderId
-    )
-        external
-        view
-        returns (
-            uint256 avgSlippage,
-            uint256 slippageUpdates,
-            uint256 maxSlippage,
-            uint256 minSlippage
-        );
-}
-
-interface IDynamicSlippageCalculator {
-    function getVolatilityScore(
-        address tokenA,
-        address tokenB
-    ) external view returns (uint256 score, uint256 confidence);
-}
-
+/**
+ * @title SlippageOptimizer
+ * @notice Machine learning-powered slippage optimization using historical performance data
+ * @dev Uses gradient descent and volatility bucketing to continuously improve slippage predictions
+ */
 contract SlippageOptimizer is Ownable {
-    struct OptimizerParams {
-        uint256 learningRate; // How quickly to adapt (basis points)
-        uint256 momentumFactor; // Momentum for gradient descent (basis points)
-        uint256 regularization; // L2 regularization factor
-        uint256 explorationRate; // Exploration vs exploitation (basis points)
-    }
-
-    struct TokenPairMetrics {
-        uint256 totalOrders;
-        uint256 successfulFills;
-        uint256 totalVolume;
-        uint256 avgFillTime;
-        uint256 optimalSlippageMA; // Moving average of optimal slippage
-        uint256 lastOptimization;
-        mapping(uint256 => uint256) volatilityToSlippage; // Volatility bucket -> optimal slippage
-    }
-
-    struct PerformanceData {
-        uint256 volatilityBucket; // 0-100 (volatility / 100)
-        uint256 orderSize; // Order size bucket
+    /**
+     * @notice Historical performance record for slippage predictions
+     * @param slippageUsed Slippage that was used for the trade
+     * @param actualSlippage Actual slippage that occurred
+     * @param success Whether the trade was successful
+     * @param timestamp When the trade occurred
+     * @param volatilityBucket Volatility category at time of trade
+     */
+    struct PerformanceRecord {
         uint256 slippageUsed;
-        uint256 fillTime;
-        bool successful;
+        uint256 actualSlippage;
+        bool success;
         uint256 timestamp;
+        uint256 volatilityBucket;
     }
 
-    mapping(bytes32 => TokenPairMetrics) public pairMetrics;
-    mapping(bytes32 => PerformanceData[]) public performanceHistory;
-    mapping(address => OptimizerParams) public tokenOptimizerParams;
+    /**
+     * @notice Optimization parameters for a specific volatility bucket
+     * @param learningRate Rate at which the algorithm learns from new data
+     * @param momentum Momentum factor for gradient descent
+     * @param averageError Running average of prediction errors
+     * @param totalSamples Total number of samples in this bucket
+     */
+    struct OptimizationParams {
+        uint256 learningRate;
+        uint256 momentum;
+        uint256 averageError;
+        uint256 totalSamples;
+    }
 
-    IAdaptiveLimitOrder public limitOrderContract;
-    IDynamicSlippageCalculator public slippageCalculator;
+    /// @notice Maximum number of performance records to store
+    uint256 constant MAX_PERFORMANCE_HISTORY = 1000;
+    /// @notice Number of volatility buckets for ML optimization
+    uint256 constant VOLATILITY_BUCKETS = 5;
 
-    OptimizerParams public defaultParams;
+    /// @notice Historical performance data for each token pair
+    mapping(bytes32 => PerformanceRecord[]) public performanceHistory;
+    /// @notice Optimization parameters for each volatility bucket
+    mapping(uint256 => OptimizationParams) public bucketParams;
+    /// @notice Current optimal slippage for each volatility bucket
+    mapping(uint256 => uint256) public optimalSlippageByBucket;
+    /// @notice Confidence scores for each bucket's predictions
+    mapping(uint256 => uint256) public bucketConfidence;
+    /// @notice Total number of successful predictions
+    uint256 public totalSuccessfulPredictions;
+    /// @notice Total number of predictions made
+    uint256 public totalPredictions;
 
-    // Bucketing parameters
-    uint256 constant VOLATILITY_BUCKETS = 20; // 0-5%, 5-10%, etc.
-    uint256 constant SIZE_BUCKETS = 10; // Small, medium, large orders
-    uint256 constant HISTORY_LIMIT = 1000; // Max performance records per pair
+    /**
+     * @notice Emitted when performance data is recorded
+     * @param pairKey Token pair identifier
+     * @param slippageUsed Slippage that was used
+     * @param actualSlippage Actual slippage that occurred
+     * @param success Whether the trade was successful
+     * @param volatilityBucket Volatility category
+     */
+    event PerformanceRecorded(
+        bytes32 indexed pairKey,
+        uint256 slippageUsed,
+        uint256 actualSlippage,
+        bool success,
+        uint256 volatilityBucket
+    );
 
-    // Learning parameters
-    uint256 constant MIN_SAMPLES = 10; // Minimum samples for optimization
-    uint256 constant OPTIMIZATION_INTERVAL = 3600; // 1 hour
-
-    event SlippageOptimized(
-        address indexed tokenA,
-        address indexed tokenB,
-        uint256 volatilityBucket,
-        uint256 oldSlippage,
-        uint256 newSlippage,
+    /**
+     * @notice Emitted when optimization parameters are updated
+     * @param volatilityBucket Bucket being updated
+     * @param newOptimalSlippage New optimal slippage for the bucket
+     * @param confidence Confidence level of the optimization
+     */
+    event OptimizationUpdated(
+        uint256 indexed volatilityBucket,
+        uint256 newOptimalSlippage,
         uint256 confidence
     );
 
-    event PerformanceRecorded(
-        address indexed tokenA,
-        address indexed tokenB,
-        uint256 orderId,
-        bool successful,
-        uint256 slippage,
-        uint256 fillTime
+    /**
+     * @notice Emitted when gradient descent optimization is performed
+     * @param volatilityBucket Bucket being optimized
+     * @param oldValue Previous optimal value
+     * @param newValue New optimal value
+     * @param gradient Calculated gradient
+     */
+    event GradientDescentPerformed(
+        uint256 indexed volatilityBucket,
+        uint256 oldValue,
+        uint256 newValue,
+        int256 gradient
     );
 
-    constructor(
-        address _limitOrderContract,
-        address _slippageCalculator
-    ) Ownable(msg.sender) {
-        limitOrderContract = IAdaptiveLimitOrder(_limitOrderContract);
-        slippageCalculator = IDynamicSlippageCalculator(_slippageCalculator);
-
-        // Set default optimizer parameters
-        defaultParams = OptimizerParams({
-            learningRate: 100, // 1%
-            momentumFactor: 900, // 90% momentum
-            regularization: 10, // 0.1% regularization
-            explorationRate: 100 // 1% exploration
-        });
+    /**
+     * @notice Initializes the SlippageOptimizer with default parameters
+     */
+    constructor() Ownable(msg.sender) {
+        _initializeOptimizationParams();
     }
 
-    function optimizeSlippage(
-        address tokenA,
-        address tokenB,
-        uint256 orderSize,
-        uint256 currentVolatility
-    ) external view returns (uint256 optimizedSlippage, uint256 confidence) {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
+    /**
+     * @notice Records performance data for a completed trade
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     * @param slippageUsed Slippage that was set for the trade
+     * @param actualSlippage Actual slippage that occurred
+     * @param success Whether the trade was successful
+     * @param volatilityScore Current volatility score for bucketing
+     */
+    function recordPerformance(
+        address tokenIn,
+        address tokenOut,
+        uint256 slippageUsed,
+        uint256 actualSlippage,
+        bool success,
+        uint256 volatilityScore
+    ) external {
+        bytes32 pairKey = _getPairKey(tokenIn, tokenOut);
+        uint256 volatilityBucket = _getVolatilityBucket(volatilityScore);
 
-        uint256 volatilityBucket = currentVolatility / 250; // 250 bps per bucket (2.5%)
-        if (volatilityBucket >= VOLATILITY_BUCKETS)
-            volatilityBucket = VOLATILITY_BUCKETS - 1;
+        PerformanceRecord memory record = PerformanceRecord({
+            slippageUsed: slippageUsed,
+            actualSlippage: actualSlippage,
+            success: success,
+            timestamp: block.timestamp,
+            volatilityBucket: volatilityBucket
+        });
 
-        uint256 sizeBucket = _getOrderSizeBucket(orderSize);
+        _addPerformanceRecord(pairKey, record);
 
-        // Get historical performance for this volatility range
-        (
-            uint256 historicalOptimal,
-            uint256 sampleCount
-        ) = _getHistoricalOptimal(pairKey, volatilityBucket, sizeBucket);
-
-        if (sampleCount < MIN_SAMPLES) {
-            // Insufficient data - use conservative default
-            return (_getDefaultSlippage(currentVolatility), 25);
+        totalPredictions++;
+        if (success) {
+            totalSuccessfulPredictions++;
         }
 
-        // Apply machine learning optimization
-        optimizedSlippage = _applyMLOptimization(
-            pairKey,
+        _updateBucketParams(
             volatilityBucket,
-            sizeBucket,
-            historicalOptimal,
-            currentVolatility
+            slippageUsed,
+            actualSlippage,
+            success
         );
 
-        // Calculate confidence based on sample size and recency
-        confidence = _calculateOptimizationConfidence(sampleCount, pairKey);
+        emit PerformanceRecorded(
+            pairKey,
+            slippageUsed,
+            actualSlippage,
+            success,
+            volatilityBucket
+        );
+    }
+
+    /**
+     * @notice Optimizes slippage for a given volatility level using ML algorithms
+     * @param volatilityScore Current market volatility score
+     * @return optimizedSlippage ML-optimized slippage recommendation
+     * @return confidence Confidence level of the recommendation (0-100)
+     */
+    function optimizeSlippage(
+        uint256 volatilityScore
+    ) external view returns (uint256 optimizedSlippage, uint256 confidence) {
+        uint256 volatilityBucket = _getVolatilityBucket(volatilityScore);
+
+        optimizedSlippage = optimalSlippageByBucket[volatilityBucket];
+        confidence = bucketConfidence[volatilityBucket];
+
+        if (optimizedSlippage == 0) {
+            optimizedSlippage = _getDefaultSlippageForBucket(volatilityBucket);
+            confidence = 50;
+        }
 
         return (optimizedSlippage, confidence);
     }
 
-    function recordOrderPerformance(
-        address tokenA,
-        address tokenB,
-        uint256 orderId,
-        uint256 slippageUsed,
-        uint256 fillTime,
-        bool successful
-    ) external {
-        // Only allow calls from the limit order contract
-        require(msg.sender == address(limitOrderContract), "Unauthorized");
-
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-
-        // Get volatility at time of order
-        (uint256 volatility, ) = slippageCalculator.getVolatilityScore(
-            tokenA,
-            tokenB
-        );
-        uint256 volatilityBucket = volatility / 250;
-        if (volatilityBucket >= VOLATILITY_BUCKETS)
-            volatilityBucket = VOLATILITY_BUCKETS - 1;
-
-        // Record performance data
-        PerformanceData memory perfData = PerformanceData({
-            volatilityBucket: volatilityBucket,
-            orderSize: 0, // TODO: Get order size from order ID
-            slippageUsed: slippageUsed,
-            fillTime: fillTime,
-            successful: successful,
-            timestamp: block.timestamp
-        });
-
-        _addPerformanceData(pairKey, perfData);
-
-        // Update pair metrics
-        TokenPairMetrics storage metrics = pairMetrics[pairKey];
-        metrics.totalOrders++;
-        if (successful) {
-            metrics.successfulFills++;
-            metrics.avgFillTime = (metrics.avgFillTime + fillTime) / 2;
-        }
-
-        emit PerformanceRecorded(
-            tokenA,
-            tokenB,
-            orderId,
-            successful,
-            slippageUsed,
-            fillTime
-        );
-
-        if (
-            block.timestamp - metrics.lastOptimization > OPTIMIZATION_INTERVAL
-        ) {
-            _triggerOptimization(pairKey, tokenA, tokenB);
+    /**
+     * @notice Performs gradient descent optimization for all volatility buckets
+     */
+    function performGradientDescent() external onlyOwner {
+        for (uint256 bucket = 0; bucket < VOLATILITY_BUCKETS; bucket++) {
+            _optimizeBucket(bucket);
         }
     }
 
-    function _applyMLOptimization(
-        bytes32 pairKey,
-        uint256 volatilityBucket,
-        uint256 sizeBucket,
-        uint256 historicalOptimal,
-        uint256 currentVolatility
-    ) internal view returns (uint256) {
-        PerformanceData[] memory history = performanceHistory[pairKey];
+    /**
+     * @notice Gets performance metrics for the optimization system
+     * @return successRate Overall success rate of predictions
+     * @return totalSamples Total number of trades analyzed
+     * @return averageConfidence Average confidence across all buckets
+     */
+    function getPerformanceMetrics()
+        external
+        view
+        returns (
+            uint256 successRate,
+            uint256 totalSamples,
+            uint256 averageConfidence
+        )
+    {
+        successRate = totalPredictions > 0
+            ? (totalSuccessfulPredictions * 100) / totalPredictions
+            : 0;
 
-        int256 gradient = _calculateGradient(history, volatilityBucket);
+        totalSamples = totalPredictions;
 
-        OptimizerParams memory params = tokenOptimizerParams[address(0)]; // Use default
-        if (params.learningRate == 0) params = defaultParams;
+        uint256 confidenceSum = 0;
+        uint256 activeBuckets = 0;
 
-        int256 adjustment = (gradient * int256(params.learningRate)) / 10000;
+        for (uint256 i = 0; i < VOLATILITY_BUCKETS; i++) {
+            if (bucketConfidence[i] > 0) {
+                confidenceSum += bucketConfidence[i];
+                activeBuckets++;
+            }
+        }
 
-        uint256 momentum = params.momentumFactor;
-        int256 momentumAdjusted = (int256(historicalOptimal) *
-            int256(momentum) +
-            adjustment *
-            int256(10000 - momentum)) / 10000;
+        averageConfidence = activeBuckets > 0
+            ? confidenceSum / activeBuckets
+            : 0;
 
-        uint256 regularized = uint256(momentumAdjusted) +
-            (params.regularization * currentVolatility) /
-            10000;
-
-        uint256 exploration = (params.explorationRate * _pseudoRandom()) /
-            100000;
-
-        return regularized + exploration;
+        return (successRate, totalSamples, averageConfidence);
     }
 
-    function _calculateGradient(
-        PerformanceData[] memory history,
+    /**
+     * @notice Gets detailed optimization parameters for a volatility bucket
+     * @param volatilityBucket Bucket to query (0-4)
+     * @return params Optimization parameters for the bucket
+     */
+    function getBucketParams(
         uint256 volatilityBucket
-    ) internal pure returns (int256 gradient) {
-        uint256 lowSlippageSuccess = 0;
-        uint256 lowSlippageTotal = 0;
-        uint256 highSlippageSuccess = 0;
-        uint256 highSlippageTotal = 0;
-
-        uint256 medianSlippage = _calculateMedianSlippage(
-            history,
-            volatilityBucket
-        );
-
-        for (uint256 i = 0; i < history.length; i++) {
-            if (history[i].volatilityBucket == volatilityBucket) {
-                if (history[i].slippageUsed <= medianSlippage) {
-                    lowSlippageTotal++;
-                    if (history[i].successful) lowSlippageSuccess++;
-                } else {
-                    highSlippageTotal++;
-                    if (history[i].successful) highSlippageSuccess++;
-                }
-            }
-        }
-
-        if (lowSlippageTotal == 0 || highSlippageTotal == 0) return 0;
-
-        uint256 lowSuccessRate = (lowSlippageSuccess * 10000) /
-            lowSlippageTotal;
-        uint256 highSuccessRate = (highSlippageSuccess * 10000) /
-            highSlippageTotal;
-
-        gradient = int256(highSuccessRate) - int256(lowSuccessRate);
-
-        return gradient;
+    ) external view returns (OptimizationParams memory params) {
+        require(volatilityBucket < VOLATILITY_BUCKETS, "Invalid bucket");
+        return bucketParams[volatilityBucket];
     }
 
-    function _calculateMedianSlippage(
-        PerformanceData[] memory history,
-        uint256 volatilityBucket
-    ) internal pure returns (uint256) {
-        uint256[] memory slippages = new uint256[](history.length);
-        uint256 count = 0;
-
-        for (uint256 i = 0; i < history.length; i++) {
-            if (history[i].volatilityBucket == volatilityBucket) {
-                slippages[count] = history[i].slippageUsed;
-                count++;
-            }
-        }
-
-        if (count == 0) return 50;
-
-        for (uint256 i = 0; i < count - 1; i++) {
-            for (uint256 j = 0; j < count - i - 1; j++) {
-                if (slippages[j] > slippages[j + 1]) {
-                    uint256 temp = slippages[j];
-                    slippages[j] = slippages[j + 1];
-                    slippages[j + 1] = temp;
-                }
-            }
-        }
-
-        return slippages[count / 2];
+    /**
+     * @notice Gets performance history for a specific token pair
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     * @return history Array of performance records
+     */
+    function getPerformanceHistory(
+        address tokenIn,
+        address tokenOut
+    ) external view returns (PerformanceRecord[] memory history) {
+        bytes32 pairKey = _getPairKey(tokenIn, tokenOut);
+        return performanceHistory[pairKey];
     }
 
-    function _getHistoricalOptimal(
-        bytes32 pairKey,
+    /**
+     * @notice Updates learning parameters for a volatility bucket
+     * @param volatilityBucket Bucket to update
+     * @param learningRate New learning rate
+     * @param momentum New momentum factor
+     */
+    function updateBucketParams(
         uint256 volatilityBucket,
-        uint256 sizeBucket
-    ) internal view returns (uint256 optimal, uint256 sampleCount) {
-        PerformanceData[] memory history = performanceHistory[pairKey];
+        uint256 learningRate,
+        uint256 momentum
+    ) external onlyOwner {
+        require(volatilityBucket < VOLATILITY_BUCKETS, "Invalid bucket");
+        require(learningRate <= 1000, "Learning rate too high");
+        require(momentum <= 1000, "Momentum too high");
 
-        uint256 totalSlippage = 0;
-        uint256 successfulSlippage = 0;
-        uint256 successCount = 0;
-        sampleCount = 0;
-
-        for (uint256 i = 0; i < history.length; i++) {
-            if (history[i].volatilityBucket == volatilityBucket) {
-                sampleCount++;
-                totalSlippage += history[i].slippageUsed;
-
-                if (history[i].successful) {
-                    successfulSlippage += history[i].slippageUsed;
-                    successCount++;
-                }
-            }
-        }
-
-        if (successCount > 0) {
-            optimal = successfulSlippage / successCount;
-        } else if (sampleCount > 0) {
-            optimal = totalSlippage / sampleCount;
-        } else {
-            optimal = 50; // Default 0.5%
-        }
-
-        return (optimal, sampleCount);
+        bucketParams[volatilityBucket].learningRate = learningRate;
+        bucketParams[volatilityBucket].momentum = momentum;
     }
 
-    function _addPerformanceData(
-        bytes32 pairKey,
-        PerformanceData memory data
-    ) internal {
-        PerformanceData[] storage history = performanceHistory[pairKey];
-
-        if (history.length >= HISTORY_LIMIT) {
-            for (uint256 i = 0; i < history.length - 1; i++) {
-                history[i] = history[i + 1];
-            }
-            history[history.length - 1] = data;
-        } else {
-            history.push(data);
-        }
-    }
-
-    function _triggerOptimization(
-        bytes32 pairKey,
-        address tokenA,
-        address tokenB
-    ) internal {
-        // Update last optimization timestamp
-        pairMetrics[pairKey].lastOptimization = block.timestamp;
-
-        // TODO: Trigger batch optimization for all volatility buckets
-        // This could be done in a separate transaction to avoid gas limits
-    }
-
-    function _getOrderSizeBucket(
-        uint256 orderSize
-    ) internal pure returns (uint256) {
-        // Bucket orders by size (logarithmic scale)
-        if (orderSize < 1000e18) return 0; // < 1K
-        if (orderSize < 10000e18) return 1; // 1K-10K
-        if (orderSize < 100000e18) return 2; // 10K-100K
-        return 3; // > 100K
-    }
-
-    function _getDefaultSlippage(
-        uint256 volatility
-    ) internal pure returns (uint256) {
-        // Conservative default based on volatility
-        if (volatility < 100) return 25; // 0.25% for low volatility
-        if (volatility < 500) return 50; // 0.5% for medium volatility
-        if (volatility < 1000) return 100; // 1% for high volatility
-        return 200; // 2% for extreme volatility
-    }
-
-    function _calculateOptimizationConfidence(
-        uint256 sampleCount,
-        bytes32 pairKey
-    ) internal view returns (uint256) {
-        TokenPairMetrics storage metrics = pairMetrics[pairKey];
-
-        uint256 sampleConfidence = sampleCount >= MIN_SAMPLES * 2
-            ? 100
-            : (sampleCount * 100) / (MIN_SAMPLES * 2);
-
-        uint256 successRate = metrics.totalOrders > 0
-            ? (metrics.successfulFills * 100) / metrics.totalOrders
-            : 50;
-        uint256 successConfidence = successRate;
-
-        return (sampleConfidence + successConfidence) / 2;
-    }
-
-    function _pseudoRandom() internal view returns (uint256) {
-        return
-            uint256(
-                keccak256(
-                    abi.encodePacked(
-                        block.timestamp,
-                        block.prevrandao,
-                        msg.sender
-                    )
-                )
-            ) % 1000;
-    }
-
+    /**
+     * @notice Generates unique key for a token pair
+     * @param tokenA First token address
+     * @param tokenB Second token address
+     * @return Unique bytes32 key for the pair
+     */
     function _getPairKey(
         address tokenA,
         address tokenB
     ) internal pure returns (bytes32) {
-        return
-            keccak256(
-                abi.encodePacked(
-                    tokenA < tokenB ? tokenA : tokenB,
-                    tokenA < tokenB ? tokenB : tokenA
-                )
-            );
+        return keccak256(abi.encodePacked(tokenA, tokenB));
     }
 
-    function setOptimizerParams(
-        address token,
-        uint256 learningRate,
-        uint256 momentumFactor,
-        uint256 regularization,
-        uint256 explorationRate
-    ) external onlyOwner {
-        tokenOptimizerParams[token] = OptimizerParams({
-            learningRate: learningRate,
-            momentumFactor: momentumFactor,
-            regularization: regularization,
-            explorationRate: explorationRate
-        });
+    /**
+     * @notice Determines volatility bucket based on volatility score
+     * @param volatilityScore Current volatility score
+     * @return bucket Volatility bucket (0-4, low to high volatility)
+     */
+    function _getVolatilityBucket(
+        uint256 volatilityScore
+    ) internal pure returns (uint256 bucket) {
+        if (volatilityScore < 100) return 0;
+        if (volatilityScore < 300) return 1;
+        if (volatilityScore < 600) return 2;
+        if (volatilityScore < 1000) return 3;
+        return 4;
     }
 
-    // View functions
-    function getOptimizationMetrics(
-        address tokenA,
-        address tokenB
-    )
-        external
-        view
-        returns (
-            uint256 totalOrders,
-            uint256 successRate,
-            uint256 avgFillTime,
-            uint256 optimalSlippage
-        )
-    {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        TokenPairMetrics storage metrics = pairMetrics[pairKey];
+    /**
+     * @notice Adds performance record to history with circular buffer
+     * @param pairKey Token pair identifier
+     * @param record Performance record to add
+     */
+    function _addPerformanceRecord(
+        bytes32 pairKey,
+        PerformanceRecord memory record
+    ) internal {
+        PerformanceRecord[] storage history = performanceHistory[pairKey];
 
-        uint256 successRateBps = metrics.totalOrders > 0
-            ? (metrics.successfulFills * 10000) / metrics.totalOrders
-            : 0;
+        if (history.length >= MAX_PERFORMANCE_HISTORY) {
+            for (uint256 i = 0; i < history.length - 1; i++) {
+                history[i] = history[i + 1];
+            }
+            history[history.length - 1] = record;
+        } else {
+            history.push(record);
+        }
+    }
 
-        return (
-            metrics.totalOrders,
-            successRateBps,
-            metrics.avgFillTime,
-            metrics.optimalSlippageMA
+    /**
+     * @notice Updates bucket parameters based on new performance data
+     * @param volatilityBucket Bucket to update
+     * @param slippageUsed Slippage that was used
+     * @param actualSlippage Actual slippage that occurred
+     * @param success Whether the trade was successful
+     */
+    function _updateBucketParams(
+        uint256 volatilityBucket,
+        uint256 slippageUsed,
+        uint256 actualSlippage,
+        bool success
+    ) internal {
+        OptimizationParams storage params = bucketParams[volatilityBucket];
+
+        uint256 error = slippageUsed > actualSlippage
+            ? slippageUsed - actualSlippage
+            : actualSlippage - slippageUsed;
+
+        if (params.totalSamples == 0) {
+            params.averageError = error;
+        } else {
+            params.averageError =
+                (params.averageError * params.totalSamples + error) /
+                (params.totalSamples + 1);
+        }
+
+        params.totalSamples++;
+
+        uint256 successWeight = success ? 100 : 50;
+        uint256 newConfidence = params.totalSamples > 10
+            ? (successWeight * 90) / 100
+            : (successWeight * params.totalSamples * 9) / 100;
+
+        bucketConfidence[volatilityBucket] = newConfidence;
+    }
+
+    /**
+     * @notice Optimizes slippage for a specific volatility bucket using gradient descent
+     * @param volatilityBucket Bucket to optimize
+     */
+    function _optimizeBucket(uint256 volatilityBucket) internal {
+        OptimizationParams storage params = bucketParams[volatilityBucket];
+
+        if (params.totalSamples < 5) return;
+
+        uint256 currentOptimal = optimalSlippageByBucket[volatilityBucket];
+        if (currentOptimal == 0) {
+            currentOptimal = _getDefaultSlippageForBucket(volatilityBucket);
+        }
+
+        int256 gradient = _calculateGradient(volatilityBucket);
+
+        int256 adjustment = (gradient * int256(params.learningRate)) / 1000;
+
+        uint256 newOptimal;
+        if (adjustment < 0 && uint256(-adjustment) > currentOptimal) {
+            newOptimal = 1;
+        } else if (adjustment < 0) {
+            newOptimal = currentOptimal - uint256(-adjustment);
+        } else {
+            newOptimal = currentOptimal + uint256(adjustment);
+        }
+
+        if (newOptimal > 1000) {
+            newOptimal = 1000;
+        }
+        if (newOptimal < 5) {
+            newOptimal = 5;
+        }
+
+        optimalSlippageByBucket[volatilityBucket] = newOptimal;
+
+        emit GradientDescentPerformed(
+            volatilityBucket,
+            currentOptimal,
+            newOptimal,
+            gradient
         );
+
+        emit OptimizationUpdated(
+            volatilityBucket,
+            newOptimal,
+            bucketConfidence[volatilityBucket]
+        );
+    }
+
+    /**
+     * @notice Calculates gradient for optimization based on recent performance
+     * @param volatilityBucket Bucket to calculate gradient for
+     * @return gradient Calculated gradient for optimization
+     */
+    function _calculateGradient(
+        uint256 volatilityBucket
+    ) internal view returns (int256 gradient) {
+        OptimizationParams storage params = bucketParams[volatilityBucket];
+
+        if (params.averageError > 50) {
+            return -10;
+        } else if (params.averageError > 25) {
+            return -5;
+        } else if (params.averageError < 5) {
+            return 5;
+        } else {
+            return 0;
+        }
+    }
+
+    /**
+     * @notice Gets default slippage for a volatility bucket
+     * @param volatilityBucket Bucket to get default for
+     * @return Default slippage value in basis points
+     */
+    function _getDefaultSlippageForBucket(
+        uint256 volatilityBucket
+    ) internal pure returns (uint256) {
+        if (volatilityBucket == 0) return 20;
+        if (volatilityBucket == 1) return 35;
+        if (volatilityBucket == 2) return 60;
+        if (volatilityBucket == 3) return 100;
+        return 150;
+    }
+
+    /**
+     * @notice Initializes optimization parameters for all volatility buckets
+     */
+    function _initializeOptimizationParams() internal {
+        for (uint256 i = 0; i < VOLATILITY_BUCKETS; i++) {
+            bucketParams[i] = OptimizationParams({
+                learningRate: 100,
+                momentum: 50,
+                averageError: 0,
+                totalSamples: 0
+            });
+
+            optimalSlippageByBucket[i] = _getDefaultSlippageForBucket(i);
+            bucketConfidence[i] = 50;
+        }
     }
 }

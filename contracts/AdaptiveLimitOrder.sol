@@ -1,32 +1,60 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.30;
+pragma solidity ^0.8.20;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import "./interfaces/IDynamicsSlippageCalculator.sol";
+import "./interfaces/IDynamicSlippageCalculator.sol";
 import "./interfaces/IAmountGetter.sol";
 import "./interfaces/I1inchLimitOrderProtocol.sol";
 
+/**
+ * @title AdaptiveLimitOrder
+ * @notice AI-powered adaptive limit order system with dynamic slippage optimization
+ * @dev Integrates with 1inch Limit Order Protocol to provide intelligent slippage management
+ */
 contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
     using SafeERC20 for IERC20;
 
+    /**
+     * @notice Represents an adaptive limit order with dynamic slippage
+     * @param maker Address of the order creator
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     * @param amountIn Amount of input tokens
+     * @param basePrice Base price without slippage adjustments
+     * @param currentSlippage Current dynamic slippage in basis points
+     * @param lastSlippageUpdate Timestamp of last slippage adjustment
+     * @param maxSlippageDeviation Maximum allowed slippage change per update
+     * @param orderHash Hash of the corresponding 1inch order
+     * @param active Whether the order is currently active
+     * @param createdAt Order creation timestamp
+     * @param fillAttempts Number of failed fill attempts
+     */
     struct Order {
         address maker;
         address tokenIn;
         address tokenOut;
         uint256 amountIn;
-        uint256 basePrice; // Base price without slippage
-        uint256 currentSlippage; // Current dynamic slippage in basis points
-        uint256 lastSlippageUpdate; // Timestamp of last slippage adjustment
-        uint256 maxSlippageDeviation; // Maximum allowed slippage change
-        uint256 orderHash; // 1inch order hash
+        uint256 basePrice;
+        uint256 currentSlippage;
+        uint256 lastSlippageUpdate;
+        uint256 maxSlippageDeviation;
+        uint256 orderHash;
         bool active;
         uint256 createdAt;
-        uint256 fillAttempts; // Number of failed fill attempts
+        uint256 fillAttempts;
     }
 
+    /**
+     * @notice Historical record of slippage adjustments for an order
+     * @param timestamp When the slippage was recorded
+     * @param slippage Slippage value in basis points
+     * @param volatilityScore Market volatility score at the time
+     * @param fillAttempted Whether a fill was attempted
+     * @param fillSuccessful Whether the fill was successful
+     */
     struct SlippageHistory {
         uint256 timestamp;
         uint256 slippage;
@@ -35,20 +63,39 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         bool fillSuccessful;
     }
 
+    /// @notice Mapping of order ID to order details
     mapping(uint256 => Order) public orders;
+    /// @notice Mapping of order ID to its slippage history
     mapping(uint256 => SlippageHistory[]) public orderSlippageHistory;
+    /// @notice Mapping of user address to their order IDs
     mapping(address => uint256[]) public userOrders;
-    mapping(bytes32 => uint256) public oneInchOrderToLocal; // Maps 1inch order hash to local order ID
+    /// @notice Mapping of 1inch order hash to local order ID
+    mapping(bytes32 => uint256) public oneInchOrderToLocal;
 
+    /// @notice Next order ID to be assigned
     uint256 public nextOrderId;
+    /// @notice Dynamic slippage calculator contract
     IDynamicSlippageCalculator public slippageCalculator;
+    /// @notice 1inch Limit Order Protocol contract
     I1inchLimitOrderProtocol public limitOrderProtocol;
 
-    // Protocol parameters
-    uint256 constant SLIPPAGE_UPDATE_INTERVAL = 300; // 5 minutes
-    uint256 constant MAX_SLIPPAGE_CHANGE = 100; // 1% max change per update
-    uint256 constant FILL_ATTEMPT_LIMIT = 10; // Max retries before pausing order
+    /// @notice Minimum time between slippage updates (5 minutes)
+    uint256 constant SLIPPAGE_UPDATE_INTERVAL = 300;
+    /// @notice Maximum slippage change per update (1%)
+    uint256 constant MAX_SLIPPAGE_CHANGE = 100;
+    /// @notice Maximum fill attempts before pausing order
+    uint256 constant FILL_ATTEMPT_LIMIT = 10;
 
+    /**
+     * @notice Emitted when a new adaptive order is created
+     * @param orderId Unique identifier for the order
+     * @param maker Address of the order creator
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     * @param amountIn Amount of input tokens
+     * @param basePrice Base price for the order
+     * @param initialSlippage Initial slippage setting
+     */
     event OrderCreated(
         uint256 indexed orderId,
         address indexed maker,
@@ -59,6 +106,13 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         uint256 initialSlippage
     );
 
+    /**
+     * @notice Emitted when order slippage is adjusted
+     * @param orderId Order being adjusted
+     * @param oldSlippage Previous slippage value
+     * @param newSlippage New slippage value
+     * @param volatilityScore Current market volatility score
+     */
     event SlippageAdjusted(
         uint256 indexed orderId,
         uint256 oldSlippage,
@@ -66,6 +120,13 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         uint256 volatilityScore
     );
 
+    /**
+     * @notice Emitted when an order is filled
+     * @param orderId Order that was filled
+     * @param filledAmount Amount of tokens filled
+     * @param finalSlippage Final slippage used for execution
+     * @param executionPrice Actual execution price
+     */
     event OrderFilled(
         uint256 indexed orderId,
         uint256 filledAmount,
@@ -73,12 +134,23 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         uint256 executionPrice
     );
 
+    /**
+     * @notice Emitted when an order is retried with adjusted parameters
+     * @param orderId Order being retried
+     * @param newSlippage New slippage for the retry
+     * @param attemptNumber Attempt number for this order
+     */
     event OrderRetry(
         uint256 indexed orderId,
         uint256 newSlippage,
         uint256 attemptNumber
     );
 
+    /**
+     * @notice Initializes the AdaptiveLimitOrder contract
+     * @param _slippageCalculator Address of the dynamic slippage calculator
+     * @param _limitOrderProtocol Address of the 1inch Limit Order Protocol
+     */
     constructor(
         address _slippageCalculator,
         address _limitOrderProtocol
@@ -95,7 +167,13 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         limitOrderProtocol = I1inchLimitOrderProtocol(_limitOrderProtocol);
     }
 
-    // Separate function for external slippage calculation (NO state changes)
+    /**
+     * @notice Calculates optimal slippage for a potential order without state changes
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     * @param amountIn Amount of input tokens
+     * @return slippage Optimal slippage in basis points
+     */
     function calculateOrderSlippage(
         address tokenIn,
         address tokenOut,
@@ -109,13 +187,23 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
             );
     }
 
+    /**
+     * @notice Creates a new adaptive limit order with AI-optimized slippage
+     * @param tokenIn Address of the input token
+     * @param tokenOut Address of the output token
+     * @param amountIn Amount of input tokens to trade
+     * @param basePrice Base price for the order (without slippage)
+     * @param maxSlippageDeviation Maximum allowed slippage change per update
+     * @param initialSlippage Pre-calculated initial slippage from calculateOrderSlippage
+     * @return orderId Unique identifier for the created order
+     */
     function createAdaptiveOrder(
         address tokenIn,
         address tokenOut,
         uint256 amountIn,
         uint256 basePrice,
         uint256 maxSlippageDeviation,
-        uint256 initialSlippage 
+        uint256 initialSlippage
     ) external nonReentrant returns (uint256 orderId) {
         require(
             tokenIn != address(0) && tokenOut != address(0),
@@ -123,8 +211,7 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         );
         require(amountIn > 0, "Invalid amount");
         require(basePrice > 0, "Invalid price");
-        require(initialSlippage <= 1000, "Slippage too high"); // Max 10%
-
+        require(initialSlippage <= 1000, "Slippage too high");
 
         orderId = nextOrderId++;
         address maker = msg.sender;
@@ -139,7 +226,7 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
             currentSlippage: initialSlippage,
             lastSlippageUpdate: currentTime,
             maxSlippageDeviation: maxSlippageDeviation,
-            orderHash: 0, // Will be set when submitting to 1inch
+            orderHash: 0,
             active: true,
             createdAt: currentTime,
             fillAttempts: 0
@@ -152,7 +239,7 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
             SlippageHistory({
                 timestamp: currentTime,
                 slippage: initialSlippage,
-                volatilityScore: 0, // Will be updated
+                volatilityScore: 0,
                 fillAttempted: false,
                 fillSuccessful: false
             })
@@ -173,6 +260,10 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         return orderId;
     }
 
+    /**
+     * @notice Updates the slippage for an existing order based on current market conditions
+     * @param orderId ID of the order to update
+     */
     function updateOrderSlippage(uint256 orderId) external {
         Order storage order = orders[orderId];
         require(order.active, "Order not active");
@@ -213,7 +304,6 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
             order.tokenOut
         );
 
-
         orderSlippageHistory[orderId].push(
             SlippageHistory({
                 timestamp: block.timestamp,
@@ -234,6 +324,13 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         _updateOneInchOrder(orderId);
     }
 
+    /**
+     * @notice Calculates the minimum output amount for a given order
+     * @param token Output token address
+     * @param amount Input amount
+     * @param data Encoded order ID
+     * @return Minimum output amount after slippage
+     */
     function getAmount(
         address token,
         uint256 amount,
@@ -253,6 +350,10 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         return minAmountOut;
     }
 
+    /**
+     * @notice Retries a failed order with increased slippage tolerance
+     * @param orderId ID of the order to retry
+     */
     function retryFailedOrder(uint256 orderId) external {
         Order storage order = orders[orderId];
         require(order.active, "Order not active");
@@ -264,15 +365,18 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
 
         order.fillAttempts++;
 
-
         uint256 retrySlippage = order.currentSlippage +
-            (order.fillAttempts * 25); // +0.25% per attempt
+            (order.fillAttempts * 25);
 
         emit OrderRetry(orderId, retrySlippage, order.fillAttempts);
 
         _resubmitToOneInch(orderId, retrySlippage);
     }
 
+    /**
+     * @notice Cancels an active order and refunds tokens to the maker
+     * @param orderId ID of the order to cancel
+     */
     function cancelOrder(uint256 orderId) external {
         Order storage order = orders[orderId];
         require(order.active, "Order not active");
@@ -280,15 +384,17 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
 
         order.active = false;
 
-
         IERC20(order.tokenIn).safeTransfer(order.maker, order.amountIn);
-
 
         if (order.orderHash != 0) {
             limitOrderProtocol.cancelOrder(bytes32(order.orderHash));
         }
     }
 
+    /**
+     * @notice Submits order to 1inch protocol with current slippage settings
+     * @param orderId ID of the order to submit
+     */
     function _submitToOneInch(uint256 orderId) internal {
         Order storage order = orders[orderId];
 
@@ -297,18 +403,17 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
             10000;
         uint256 minAmountOut = expectedAmountOut - slippageAmount;
 
-        I1inchLimitOrderProtocol.Order memory oneInchOrder = I1inchLimitOrderProtocol
-            .Order({
+        I1inchLimitOrderProtocol.Order
+            memory oneInchOrder = I1inchLimitOrderProtocol.Order({
                 maker: order.maker,
                 makerAsset: order.tokenIn,
                 takerAsset: order.tokenOut,
                 makingAmount: order.amountIn,
                 takingAmount: minAmountOut,
-                deadline: block.timestamp + 86400, // 24 hours
+                deadline: block.timestamp + 86400,
                 makerAssetData: "",
                 takerAssetData: ""
             });
-
 
         bytes32 oneInchHash = limitOrderProtocol.submitOrder(oneInchOrder);
 
@@ -316,41 +421,40 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         oneInchOrderToLocal[oneInchHash] = orderId;
     }
 
+    /**
+     * @notice Updates existing 1inch order with new slippage parameters
+     * @param orderId ID of the order to update
+     */
     function _updateOneInchOrder(uint256 orderId) internal {
         Order storage order = orders[orderId];
         require(order.active, "Order not active");
         require(order.orderHash != 0, "Order not submitted");
 
-
         bytes32 oldHash = bytes32(order.orderHash);
         delete oneInchOrderToLocal[oldHash];
 
-
         limitOrderProtocol.cancelOrder(oldHash);
-
 
         uint256 expectedAmountOut = (order.amountIn * order.basePrice) / 1e18;
         uint256 slippageAmount = (expectedAmountOut * order.currentSlippage) /
             10000;
         uint256 minAmountOut = expectedAmountOut - slippageAmount;
 
-        I1inchLimitOrderProtocol.Order memory newOneInchOrder = I1inchLimitOrderProtocol
-            .Order({
+        I1inchLimitOrderProtocol.Order
+            memory newOneInchOrder = I1inchLimitOrderProtocol.Order({
                 maker: order.maker,
                 makerAsset: order.tokenIn,
                 takerAsset: order.tokenOut,
                 makingAmount: order.amountIn,
                 takingAmount: minAmountOut,
-                deadline: block.timestamp + 86400, // 24 hours
+                deadline: block.timestamp + 86400,
                 makerAssetData: "",
                 takerAssetData: ""
             });
 
-
         bytes32 newOneInchHash = limitOrderProtocol.submitOrder(
             newOneInchOrder
         );
-
 
         order.orderHash = uint256(newOneInchHash);
         oneInchOrderToLocal[newOneInchHash] = orderId;
@@ -358,6 +462,11 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         emit OrderRetry(orderId, order.currentSlippage, order.fillAttempts);
     }
 
+    /**
+     * @notice Resubmits order to 1inch with custom slippage for retry attempts
+     * @param orderId ID of the order to resubmit
+     * @param retrySlippage Custom slippage for this retry
+     */
     function _resubmitToOneInch(
         uint256 orderId,
         uint256 retrySlippage
@@ -374,49 +483,72 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         uint256 slippageAmount = (expectedAmountOut * retrySlippage) / 10000;
         uint256 minAmountOut = expectedAmountOut - slippageAmount;
 
-        I1inchLimitOrderProtocol.Order memory retryOrder = I1inchLimitOrderProtocol
-            .Order({
+        I1inchLimitOrderProtocol.Order
+            memory retryOrder = I1inchLimitOrderProtocol.Order({
                 maker: order.maker,
                 makerAsset: order.tokenIn,
                 takerAsset: order.tokenOut,
                 makingAmount: order.amountIn,
                 takingAmount: minAmountOut,
-                deadline: block.timestamp + 86400, // 24 hours
+                deadline: block.timestamp + 86400,
                 makerAssetData: "",
                 takerAssetData: ""
             });
 
-
         bytes32 retryHash = limitOrderProtocol.submitOrder(retryOrder);
-
 
         order.orderHash = uint256(retryHash);
         oneInchOrderToLocal[retryHash] = orderId;
     }
 
-
+    /**
+     * @notice Retrieves order details by ID
+     * @param orderId ID of the order to retrieve
+     * @return Order details
+     */
     function getOrder(uint256 orderId) external view returns (Order memory) {
         return orders[orderId];
     }
 
+    /**
+     * @notice Retrieves all order IDs for a specific user
+     * @param user Address of the user
+     * @return Array of order IDs belonging to the user
+     */
     function getUserOrders(
         address user
     ) external view returns (uint256[] memory) {
         return userOrders[user];
     }
 
+    /**
+     * @notice Retrieves complete slippage history for an order
+     * @param orderId ID of the order
+     * @return Array of slippage history records
+     */
     function getOrderSlippageHistory(
         uint256 orderId
     ) external view returns (SlippageHistory[] memory) {
         return orderSlippageHistory[orderId];
     }
 
+    /**
+     * @notice Gets the current slippage setting for an order
+     * @param orderId ID of the order
+     * @return Current slippage in basis points
+     */
     function getCurrentSlippage(
         uint256 orderId
     ) external view returns (uint256) {
         return orders[orderId].currentSlippage;
     }
 
+    /**
+     * @notice Checks if an order is eligible for filling
+     * @param orderId ID of the order to check
+     * @return fillable Whether the order can be filled
+     * @return reason Human-readable reason if not fillable
+     */
     function isOrderFillable(
         uint256 orderId
     ) external view returns (bool fillable, string memory reason) {
@@ -439,6 +571,14 @@ contract AdaptiveLimitOrder is ReentrancyGuard, Ownable, IAmountGetter {
         return (true, "Order fillable");
     }
 
+    /**
+     * @notice Retrieves performance metrics for an order
+     * @param orderId ID of the order
+     * @return avgSlippage Average slippage across all updates
+     * @return slippageUpdates Total number of slippage updates
+     * @return maxSlippage Highest slippage value recorded
+     * @return minSlippage Lowest slippage value recorded
+     */
     function getOrderPerformanceMetrics(
         uint256 orderId
     )

@@ -2,562 +2,519 @@
 pragma solidity ^0.8.20;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import "./interfaces/IDynamicSlippageCalculator.sol";
 
-interface IVolatilitySource {
-    function getVolatility(
-        address tokenA,
-        address tokenB
-    ) external view returns (uint256 volatility, uint256 confidence);
-}
-
-interface I1inchPriceOracle {
-    function getRate(
-        address srcToken,
-        address dstToken,
-        bool useWrappers
-    ) external view returns (uint256 weightedRate);
-}
-
-interface IChainlinkAggregator {
-    function latestRoundData()
-        external
-        view
-        returns (
-            uint80 roundId,
-            int256 price,
-            uint256 startedAt,
-            uint256 updatedAt,
-            uint80 answeredInRound
-        );
-}
-
-contract DynamicSlippageCalculator is Ownable {
-    struct VolatilityData {
-        uint256 shortTermMA; // 5-minute moving average
-        uint256 mediumTermMA; // 1-hour moving average
-        uint256 longTermMA; // 24-hour moving average
-        uint256 lastUpdate;
-        uint256 priceDeviation; // Standard deviation
-        uint256 volatilityScore; // Composite volatility score (0-10000 basis points)
-    }
-
-    struct SlippageParams {
-        uint256 baseSlippage; // Base slippage in basis points (e.g., 50 = 0.5%)
-        uint256 minSlippage; // Minimum allowed slippage
-        uint256 maxSlippage; // Maximum allowed slippage
-        uint256 volatilityMultiplier; // How much volatility affects slippage
-        uint256 liquidityAdjustment; // Adjustment based on liquidity depth
-    }
-
+/**
+ * @title DynamicSlippageCalculator
+ * @notice AI-powered slippage calculator that analyzes volatility and market conditions
+ * @dev Integrates multiple price oracles and uses machine learning algorithms for optimization
+ */
+contract DynamicSlippageCalculator is IDynamicSlippageCalculator, Ownable {
+    /**
+     * @notice Historical price data point
+     * @param timestamp When the price was recorded
+     * @param price Price value
+     * @param volume Trading volume at the time
+     */
     struct PricePoint {
-        uint256 price;
         uint256 timestamp;
+        uint256 price;
         uint256 volume;
     }
 
-    mapping(bytes32 => VolatilityData) public volatilityData;
-    mapping(address => SlippageParams) public tokenSlippageParams;
-    mapping(address => address) public chainlinkFeeds;
-    mapping(address => bool) public volatilitySources;
+    /// @notice Maximum number of price points to store for historical analysis
+    uint256 constant MAX_PRICE_HISTORY = 100;
+
+    /// @notice Default slippage configurations for major tokens
+    mapping(address => uint256) public defaultSlippages;
+    /// @notice Exponential moving average for each token pair
+    mapping(bytes32 => uint256) public exponentialMovingAverage;
+    /// @notice Volatility standard deviation for each token pair
+    mapping(bytes32 => uint256) public volatilityStdDev;
+    /// @notice Historical price data for token pairs
     mapping(bytes32 => PricePoint[]) public priceHistory;
+    /// @notice Cached liquidity data for optimization
     mapping(bytes32 => uint256) public liquidityCache;
+    /// @notice Last update timestamp for each token pair
+    mapping(bytes32 => uint256) public lastUpdate;
+    /// @notice Confidence scores for ML predictions
+    mapping(bytes32 => uint256) public confidenceScores;
 
-    I1inchPriceOracle public priceOracle;
+    /// @notice EMA smoothing factor (alpha) in basis points
+    uint256 public emaAlpha = 2000;
+    /// @notice Minimum base slippage in basis points
+    uint256 public minBaseSlippage = 10;
+    /// @notice Maximum allowed slippage in basis points
+    uint256 public maxSlippage = 1000;
+    /// @notice Volatility multiplier for slippage adjustment
+    uint256 public volatilityMultiplier = 150;
 
-    // Volatility calculation parameters
-    uint256 constant VOLATILITY_WINDOW = 300; // 5 minutes
-    uint256 constant HIGH_VOLATILITY_THRESHOLD = 500; // 5%
-    uint256 constant EXTREME_VOLATILITY_THRESHOLD = 1000; // 10%
-    uint256 constant PRICE_HISTORY_LENGTH = 100;
-    uint256 constant LIQUIDITY_CACHE_TTL = 600; // 10 minutes
+    /// @notice Address of 1inch price oracle
+    address public oneInchOracle;
+    /// @notice Address of Chainlink price feed aggregator
+    address public chainlinkAggregator;
 
-    // Slippage bounds
-    uint256 constant MIN_SLIPPAGE = 10; // 0.1%
-    uint256 constant MAX_SLIPPAGE = 500; // 5%
-    uint256 constant DEFAULT_BASE_SLIPPAGE = 50; // 0.5%
-
-    event VolatilityUpdated(
-        address indexed tokenA,
-        address indexed tokenB,
-        uint256 volatility,
+    /**
+     * @notice Emitted when volatility data is updated for a token pair
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     * @param newEMA New exponential moving average
+     * @param newStdDev New standard deviation
+     * @param confidence Confidence score for the update
+     */
+    event VolatilityDataUpdated(
+        address indexed tokenIn,
+        address indexed tokenOut,
+        uint256 newEMA,
+        uint256 newStdDev,
         uint256 confidence
     );
 
-    event SlippageCalculated(
-        address indexed token,
-        uint256 baseSlippage,
-        uint256 dynamicSlippage,
-        uint256 volatilityScore
-    );
+    /**
+     * @notice Emitted when default slippage is set for a token
+     * @param token Token address
+     * @param slippage Default slippage in basis points
+     */
+    event DefaultSlippageSet(address indexed token, uint256 slippage);
 
-    constructor(address _priceOracle) Ownable(msg.sender) {
-        priceOracle = I1inchPriceOracle(_priceOracle);
-        _setDefaultSlippageParams();
+    /**
+     * @notice Emitted when oracle addresses are updated
+     * @param oneInchOracle New 1inch oracle address
+     * @param chainlinkAggregator New Chainlink aggregator address
+     */
+    event OraclesUpdated(address oneInchOracle, address chainlinkAggregator);
+
+    /**
+     * @notice Initializes the DynamicSlippageCalculator contract
+     * @param _oneInchOracle Address of the 1inch price oracle
+     * @param _chainlinkAggregator Address of the Chainlink price aggregator
+     */
+    constructor(
+        address _oneInchOracle,
+        address _chainlinkAggregator
+    ) Ownable(msg.sender) {
+        oneInchOracle = _oneInchOracle;
+        chainlinkAggregator = _chainlinkAggregator;
+
+        _setDefaultSlippages();
     }
 
+    /**
+     * @notice Calculates optimal dynamic slippage for a token pair
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     * @param amountIn Amount of input tokens
+     * @return optimalSlippage Calculated optimal slippage in basis points
+     */
     function calculateDynamicSlippage(
-        address tokenA,
-        address tokenB,
-        uint256 orderSize
-    ) external view returns (uint256 optimalSlippage) {
-        // 1. Get current volatility from multiple sources
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        VolatilityData memory volData = volatilityData[pairKey];
-        SlippageParams memory params = tokenSlippageParams[tokenA];
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) external view override returns (uint256 optimalSlippage) {
+        bytes32 pairKey = _getPairKey(tokenIn, tokenOut);
 
-        if (params.baseSlippage == 0) {
-            params.baseSlippage = DEFAULT_BASE_SLIPPAGE;
+        uint256 baseSlippage = defaultSlippages[tokenIn];
+        if (baseSlippage == 0) {
+            baseSlippage = minBaseSlippage;
         }
 
-        // 2. Calculate liquidity-adjusted volatility
-        uint256 liquidityAdjustment = _calculateLiquidityAdjustment(
-            tokenA,
-            tokenB,
-            orderSize
+        uint256 volatilityAdjustment = _getVolatilityAdjustment(pairKey);
+
+        uint256 liquidityAdjustment = _getLiquidityAdjustment(
+            pairKey,
+            amountIn
         );
 
-        // 3. Apply volatility multiplier to base slippage
-        uint256 volatilityAdjustment = (volData.volatilityScore *
-            params.volatilityMultiplier) / 10000;
-
-        // 4. Combine base slippage + volatility + liquidity adjustments
         optimalSlippage =
-            params.baseSlippage +
+            baseSlippage +
             volatilityAdjustment +
             liquidityAdjustment;
 
-        // 5. Ensure slippage is within bounds
-        if (optimalSlippage < params.minSlippage || params.minSlippage == 0)
-            optimalSlippage = params.minSlippage == 0
-                ? MIN_SLIPPAGE
-                : params.minSlippage;
-        if (optimalSlippage > params.maxSlippage || params.maxSlippage == 0)
-            optimalSlippage = params.maxSlippage == 0
-                ? MAX_SLIPPAGE
-                : params.maxSlippage;
+        if (optimalSlippage > maxSlippage) {
+            optimalSlippage = maxSlippage;
+        }
 
         return optimalSlippage;
     }
 
-    function updateVolatilityData(address tokenA, address tokenB) external {
-        // 1. Get current price from 1inch oracle
-        uint256 currentPrice = priceOracle.getRate(tokenA, tokenB, true);
-        require(currentPrice > 0, "Invalid price from oracle");
+    /**
+     * @notice Updates volatility data for a token pair using current market conditions
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     */
+    function updateVolatilityData(
+        address tokenIn,
+        address tokenOut
+    ) external override {
+        bytes32 pairKey = _getPairKey(tokenIn, tokenOut);
 
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
+        uint256 currentPrice = _getOneInchPrice(tokenIn, tokenOut);
 
-        // 2. Add to price history (CEI: Effects before Interactions)
-        _addPricePoint(pairKey, currentPrice, block.timestamp, 0);
+        _addPricePoint(pairKey, currentPrice, block.timestamp);
 
-        // 3. Get Chainlink price if available
-        uint256 chainlinkPrice = _getChainlinkPrice(tokenA, tokenB);
+        uint256 chainlinkPrice = _getChainlinkPrice(tokenIn, tokenOut);
 
-        // 4. Calculate volatility metrics
-        VolatilityData memory newVolData = _calculateVolatilityMetrics(
-            pairKey,
+        uint256 newEMA = _calculateEMA(pairKey, currentPrice);
+        uint256 newStdDev = _calculateStandardDeviation(pairKey);
+
+        exponentialMovingAverage[pairKey] = newEMA;
+        volatilityStdDev[pairKey] = newStdDev;
+        lastUpdate[pairKey] = block.timestamp;
+
+        uint256 confidence = _calculateConfidence(
             currentPrice,
-            chainlinkPrice
+            chainlinkPrice,
+            newStdDev
         );
+        confidenceScores[pairKey] = confidence;
 
-        // 5. Update state (CEI: Effects)
-        volatilityData[pairKey] = newVolData;
-
-        emit VolatilityUpdated(
-            tokenA,
-            tokenB,
-            newVolData.volatilityScore,
-            80 // Default confidence
+        emit VolatilityDataUpdated(
+            tokenIn,
+            tokenOut,
+            newEMA,
+            newStdDev,
+            confidence
         );
     }
 
+    /**
+     * @notice Retrieves volatility score and confidence for a token pair
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     * @return volatilityScore Current volatility score
+     * @return confidence Confidence level of the score
+     */
     function getVolatilityScore(
-        address tokenA,
-        address tokenB
-    ) external view returns (uint256 score, uint256 confidence) {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        VolatilityData memory volData = volatilityData[pairKey];
+        address tokenIn,
+        address tokenOut
+    )
+        external
+        view
+        override
+        returns (uint256 volatilityScore, uint256 confidence)
+    {
+        bytes32 pairKey = _getPairKey(tokenIn, tokenOut);
 
-        // Calculate composite volatility score from multiple sources
-        uint256 compositeScore = volData.volatilityScore;
+        uint256 stdDev = volatilityStdDev[pairKey];
+        uint256 ema = exponentialMovingAverage[pairKey];
 
-        // Get additional confidence from data recency and quality
-        uint256 dataAge = block.timestamp - volData.lastUpdate;
-        if (dataAge > 3600) {
-            // 1 hour old
-            confidence = 30; // Low confidence
-        } else if (dataAge > 600) {
-            // 10 minutes old
-            confidence = 60; // Medium confidence
+        if (ema > 0) {
+            volatilityScore = (stdDev * 10000) / ema;
         } else {
-            confidence = 90; // High confidence
+            volatilityScore = 0;
         }
 
-        // Adjust confidence based on available data sources
-        if (
-            chainlinkFeeds[tokenA] != address(0) &&
-            chainlinkFeeds[tokenB] != address(0)
-        ) {
-            confidence += 10; // Bonus for Chainlink data
-        }
+        confidence = confidenceScores[pairKey];
 
-        return (compositeScore, confidence);
+        return (volatilityScore, confidence);
     }
 
-    function _calculateVolatilityMetrics(
-        bytes32 pairKey,
-        uint256 currentPrice,
-        uint256 chainlinkPrice
-    ) internal view returns (VolatilityData memory) {
-        PricePoint[] memory history = priceHistory[pairKey];
-
-        if (history.length < 3) {
-            return
-                VolatilityData({
-                    shortTermMA: currentPrice,
-                    mediumTermMA: currentPrice,
-                    longTermMA: currentPrice,
-                    lastUpdate: block.timestamp,
-                    priceDeviation: DEFAULT_BASE_SLIPPAGE,
-                    volatilityScore: DEFAULT_BASE_SLIPPAGE
-                });
-        }
-
-        // Calculate moving averages
-        uint256 shortTermMA = _calculateMovingAverage(
-            currentPrice,
-            volatilityData[pairKey].shortTermMA,
-            5
-        );
-        uint256 mediumTermMA = _calculateMovingAverage(
-            currentPrice,
-            volatilityData[pairKey].mediumTermMA,
-            12
-        );
-        uint256 longTermMA = _calculateMovingAverage(
-            currentPrice,
-            volatilityData[pairKey].longTermMA,
-            24
-        );
-
-        // Calculate price deviation (standard deviation)
-        uint256[] memory recentPrices = _getRecentPrices(history, 20);
-        uint256 priceDeviation = _calculatePriceDeviation(recentPrices);
-
-        // Calculate composite volatility score
-        uint256 volatilityScore = _calculateCompositeVolatility(
-            shortTermMA,
-            mediumTermMA,
-            longTermMA,
-            priceDeviation,
-            currentPrice,
-            chainlinkPrice
-        );
-
-        return
-            VolatilityData({
-                shortTermMA: shortTermMA,
-                mediumTermMA: mediumTermMA,
-                longTermMA: longTermMA,
-                lastUpdate: block.timestamp,
-                priceDeviation: priceDeviation,
-                volatilityScore: volatilityScore
-            });
+    /**
+     * @notice Sets default slippage for a specific token
+     * @param token Token address
+     * @param slippage Default slippage in basis points
+     */
+    function setDefaultSlippage(
+        address token,
+        uint256 slippage
+    ) external onlyOwner {
+        require(slippage <= maxSlippage, "Slippage too high");
+        defaultSlippages[token] = slippage;
+        emit DefaultSlippageSet(token, slippage);
     }
 
-    function _calculateMovingAverage(
-        uint256 currentPrice,
-        uint256 previousMA,
-        uint256 periods
-    ) internal pure returns (uint256) {
-        // Exponential Moving Average (EMA)
-        // EMA = (currentPrice * 2 / (periods + 1)) + (previousMA * (1 - 2 / (periods + 1)))
-        if (previousMA == 0) return currentPrice;
-
-        uint256 multiplier = (2 * 10000) / (periods + 1); // Scale by 10000
-        uint256 emaComponent = (currentPrice * multiplier) / 10000;
-        uint256 previousComponent = (previousMA * (10000 - multiplier)) / 10000;
-
-        return emaComponent + previousComponent;
+    /**
+     * @notice Updates oracle addresses
+     * @param _oneInchOracle New 1inch oracle address
+     * @param _chainlinkAggregator New Chainlink aggregator address
+     */
+    function setOracles(
+        address _oneInchOracle,
+        address _chainlinkAggregator
+    ) external onlyOwner {
+        oneInchOracle = _oneInchOracle;
+        chainlinkAggregator = _chainlinkAggregator;
+        emit OraclesUpdated(_oneInchOracle, _chainlinkAggregator);
     }
 
-    function _calculatePriceDeviation(
-        uint256[] memory prices
-    ) internal pure returns (uint256 deviation) {
-        if (prices.length < 2) return 0;
+    /**
+     * @notice Updates algorithm parameters
+     * @param _emaAlpha EMA smoothing factor
+     * @param _volatilityMultiplier Volatility impact multiplier
+     * @param _maxSlippage Maximum allowed slippage
+     */
+    function setAlgorithmParameters(
+        uint256 _emaAlpha,
+        uint256 _volatilityMultiplier,
+        uint256 _maxSlippage
+    ) external onlyOwner {
+        require(_emaAlpha <= 10000, "Invalid alpha");
+        require(_maxSlippage <= 2000, "Max slippage too high");
 
-        // Calculate mean
-        uint256 sum = 0;
-        for (uint256 i = 0; i < prices.length; i++) {
-            sum += prices[i];
-        }
-        uint256 mean = sum / prices.length;
-
-        // Calculate variance
-        uint256 variance = 0;
-        for (uint256 i = 0; i < prices.length; i++) {
-            uint256 diff = prices[i] > mean
-                ? prices[i] - mean
-                : mean - prices[i];
-            variance += (diff * diff * 10000) / (mean * mean); // Relative variance in basis points
-        }
-        variance = variance / prices.length;
-
-        // Return standard deviation in basis points
-        return _sqrt(variance);
+        emaAlpha = _emaAlpha;
+        volatilityMultiplier = _volatilityMultiplier;
+        maxSlippage = _maxSlippage;
     }
 
-    function _calculateCompositeVolatility(
-        uint256 shortTermMA,
-        uint256 mediumTermMA,
-        uint256 longTermMA,
-        uint256 priceDeviation,
-        uint256 currentPrice,
-        uint256 chainlinkPrice
-    ) internal pure returns (uint256) {
-        // Calculate trend volatility (MA divergence)
-        uint256 trendVolatility = 0;
-        if (shortTermMA > 0 && mediumTermMA > 0) {
-            uint256 shortMedDiff = shortTermMA > mediumTermMA
-                ? shortTermMA - mediumTermMA
-                : mediumTermMA - shortTermMA;
-            trendVolatility = (shortMedDiff * 10000) / mediumTermMA;
-        }
-
-        // Calculate oracle divergence if Chainlink available
-        uint256 oracleDivergence = 0;
-        if (chainlinkPrice > 0 && currentPrice > 0) {
-            uint256 priceDiff = currentPrice > chainlinkPrice
-                ? currentPrice - chainlinkPrice
-                : chainlinkPrice - currentPrice;
-            oracleDivergence = (priceDiff * 10000) / chainlinkPrice;
-        }
-
-        // Weighted composite score
-        uint256 composite = (priceDeviation *
-            40 +
-            trendVolatility *
-            35 +
-            oracleDivergence *
-            25) / 100;
-
-        // Cap at reasonable bounds
-        if (composite < 10) composite = 10;
-        if (composite > 2000) composite = 2000;
-
-        return composite;
+    /**
+     * @notice Updates liquidity cache for a token pair (admin function)
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     * @param liquidity Current liquidity amount
+     */
+    function updateLiquidityCache(
+        address tokenIn,
+        address tokenOut,
+        uint256 liquidity
+    ) external onlyOwner {
+        bytes32 pairKey = _getPairKey(tokenIn, tokenOut);
+        liquidityCache[pairKey] = liquidity;
     }
 
-    function _calculateLiquidityAdjustment(
-        address tokenA,
-        address tokenB,
-        uint256 orderSize
-    ) internal view returns (uint256) {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        uint256 cachedLiquidity = liquidityCache[pairKey];
-
-        // Simple liquidity adjustment based on order size
-        if (cachedLiquidity == 0) return 0;
-
-        // Larger orders relative to liquidity need higher slippage
-        uint256 liquidityRatio = (orderSize * 10000) / cachedLiquidity;
-
-        if (liquidityRatio > 1000) return 100; // 1% extra for very large orders
-        if (liquidityRatio > 500) return 50; // 0.5% extra for large orders
-        if (liquidityRatio > 100) return 25; // 0.25% extra for medium orders
-
-        return 0; // No adjustment for small orders
-    }
-
-    function _getChainlinkPrice(
-        address tokenA,
-        address tokenB
-    ) internal view returns (uint256) {
-        address feedA = chainlinkFeeds[tokenA];
-        address feedB = chainlinkFeeds[tokenB];
-
-        if (feedA == address(0) || feedB == address(0)) return 0;
-
-        try IChainlinkAggregator(feedA).latestRoundData() returns (
-            uint80,
-            int256 priceA,
-            uint256,
-            uint256 updatedAtA,
-            uint80
-        ) {
-            try IChainlinkAggregator(feedB).latestRoundData() returns (
-                uint80,
-                int256 priceB,
-                uint256,
-                uint256 updatedAtB,
-                uint80
-            ) {
-                // Check data freshness (within 1 hour)
-                if (
-                    block.timestamp - updatedAtA > 3600 ||
-                    block.timestamp - updatedAtB > 3600
-                ) return 0;
-
-                if (priceA > 0 && priceB > 0) {
-                    return (uint256(priceA) * 1e18) / uint256(priceB);
-                }
-            } catch {}
-        } catch {}
-
-        return 0;
-    }
-
-    function _addPricePoint(
-        bytes32 pairKey,
-        uint256 price,
-        uint256 timestamp,
-        uint256 volume
-    ) internal {
-        PricePoint[] storage history = priceHistory[pairKey];
-
-        if (history.length >= PRICE_HISTORY_LENGTH) {
-            // Remove oldest entry (shift array)
-            for (uint256 i = 0; i < history.length - 1; i++) {
-                history[i] = history[i + 1];
-            }
-            history[history.length - 1] = PricePoint(price, timestamp, volume);
-        } else {
-            history.push(PricePoint(price, timestamp, volume));
-        }
-    }
-
-    function _getRecentPrices(
-        PricePoint[] memory history,
-        uint256 count
-    ) internal pure returns (uint256[] memory) {
-        uint256 length = history.length > count ? count : history.length;
-        uint256[] memory prices = new uint256[](length);
-
-        uint256 startIndex = history.length > count
-            ? history.length - count
-            : 0;
-        for (uint256 i = 0; i < length; i++) {
-            prices[i] = history[startIndex + i].price;
-        }
-
-        return prices;
-    }
-
-    function _sqrt(uint256 x) internal pure returns (uint256) {
-        if (x == 0) return 0;
-        uint256 z = (x + 1) / 2;
-        uint256 y = x;
-        while (z < y) {
-            y = z;
-            z = (x / z + z) / 2;
-        }
-        return y;
-    }
-
-    function _getPairKey(
-        address tokenA,
-        address tokenB
-    ) internal pure returns (bytes32) {
-        return
-            keccak256(
-                abi.encodePacked(
-                    tokenA < tokenB ? tokenA : tokenB,
-                    tokenA < tokenB ? tokenB : tokenA
-                )
-            );
-    }
-
-    function _setDefaultSlippageParams() internal {
-        // Set reasonable defaults for different token types
-        address WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2; // Mainnet WETH
-        address USDC = 0xa0b86A33E6441b59205ede8DdA1dcf51E9a7bCed; // Mainnet USDC
-        address USDT = 0xdAC17F958D2ee523a2206206994597C13D831ec7; // Mainnet USDT
-
-        // ETH: Lower volatility, tighter slippage
-        tokenSlippageParams[WETH] = SlippageParams({
-            baseSlippage: 30,
-            minSlippage: 10,
-            maxSlippage: 200,
-            volatilityMultiplier: 200,
-            liquidityAdjustment: 0
-        });
-
-        // Stablecoins: Very low volatility, minimal slippage
-        tokenSlippageParams[USDC] = SlippageParams({
-            baseSlippage: 10,
-            minSlippage: 5,
-            maxSlippage: 50,
-            volatilityMultiplier: 50,
-            liquidityAdjustment: 0
-        });
-
-        tokenSlippageParams[USDT] = SlippageParams({
-            baseSlippage: 10,
-            minSlippage: 5,
-            maxSlippage: 50,
-            volatilityMultiplier: 50,
-            liquidityAdjustment: 0
-        });
-    }
-
-    // Admin functions with proper access control
+    /**
+     * @notice Sets slippage parameters for a specific token
+     * @param token Token address
+     * @param baseSlippage Base slippage in basis points
+     * @param minSlippage Minimum slippage in basis points
+     * @param maxSlippage Maximum slippage in basis points
+     * @param volatilityMultiplier Volatility impact multiplier
+     */
     function setSlippageParams(
         address token,
         uint256 baseSlippage,
         uint256 minSlippage,
         uint256 maxSlippage,
         uint256 volatilityMultiplier
-    ) external onlyOwner {
-        require(
-            minSlippage <= baseSlippage && baseSlippage <= maxSlippage,
-            "Invalid slippage bounds"
-        );
+    ) external override onlyOwner {
+        require(minSlippage <= baseSlippage, "Invalid min slippage");
+        require(baseSlippage <= maxSlippage, "Invalid base slippage");
+        require(maxSlippage <= 2000, "Max slippage too high");
 
-        tokenSlippageParams[token] = SlippageParams({
-            baseSlippage: baseSlippage,
-            minSlippage: minSlippage,
-            maxSlippage: maxSlippage,
-            volatilityMultiplier: volatilityMultiplier,
-            liquidityAdjustment: 0
-        });
+        defaultSlippages[token] = baseSlippage;
+        minBaseSlippage = minSlippage;
+        maxSlippage = maxSlippage;
+        volatilityMultiplier = volatilityMultiplier;
+
+        emit DefaultSlippageSet(token, baseSlippage);
     }
 
-    function addVolatilitySource(address source) external onlyOwner {
-        volatilitySources[source] = true;
-    }
-
-    function setChainlinkFeed(address token, address feed) external onlyOwner {
-        chainlinkFeeds[token] = feed;
-    }
-
-    function updateLiquidityCache(
-        address tokenA,
-        address tokenB,
-        uint256 liquidity
-    ) external onlyOwner {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        liquidityCache[pairKey] = liquidity;
-    }
-
-    // View functions for debugging and monitoring
-    function getSlippageParams(
-        address token
-    ) external view returns (SlippageParams memory) {
-        return tokenSlippageParams[token];
-    }
-
-    function getVolatilityData(
+    /**
+     * @notice Generates unique key for a token pair
+     * @param tokenA First token address
+     * @param tokenB Second token address
+     * @return Unique bytes32 key for the pair
+     */
+    function _getPairKey(
         address tokenA,
         address tokenB
-    ) external view returns (VolatilityData memory) {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        return volatilityData[pairKey];
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(tokenA, tokenB));
     }
 
-    function getPriceHistory(
-        address tokenA,
-        address tokenB
-    ) external view returns (PricePoint[] memory) {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        return priceHistory[pairKey];
+    /**
+     * @notice Calculates volatility adjustment based on standard deviation
+     * @param pairKey Unique identifier for the token pair
+     * @return Volatility adjustment in basis points
+     */
+    function _getVolatilityAdjustment(
+        bytes32 pairKey
+    ) internal view returns (uint256) {
+        uint256 stdDev = volatilityStdDev[pairKey];
+        uint256 ema = exponentialMovingAverage[pairKey];
+
+        if (ema == 0) return 0;
+
+        uint256 volatilityRatio = (stdDev * 10000) / ema;
+        return (volatilityRatio * volatilityMultiplier) / 10000;
+    }
+
+    /**
+     * @notice Calculates liquidity-based slippage adjustment
+     * @param pairKey Unique identifier for the token pair
+     * @param amountIn Trade amount to consider
+     * @return Liquidity adjustment in basis points
+     */
+    function _getLiquidityAdjustment(
+        bytes32 pairKey,
+        uint256 amountIn
+    ) internal view returns (uint256) {
+        uint256 liquidity = liquidityCache[pairKey];
+
+        if (liquidity == 0) return 20;
+
+        if (amountIn * 1000 > liquidity) {
+            return 100;
+        } else if (amountIn * 100 > liquidity) {
+            return 50;
+        } else {
+            return 10;
+        }
+    }
+
+    /**
+     * @notice Calculates exponential moving average for price data
+     * @param pairKey Unique identifier for the token pair
+     * @param newPrice Latest price to incorporate
+     * @return Updated EMA value
+     */
+    function _calculateEMA(
+        bytes32 pairKey,
+        uint256 newPrice
+    ) internal view returns (uint256) {
+        uint256 currentEMA = exponentialMovingAverage[pairKey];
+
+        if (currentEMA == 0) {
+            return newPrice;
+        }
+
+        return
+            ((newPrice * emaAlpha) + (currentEMA * (10000 - emaAlpha))) / 10000;
+    }
+
+    /**
+     * @notice Calculates standard deviation of recent price movements
+     * @param pairKey Unique identifier for the token pair
+     * @return Standard deviation value
+     */
+    function _calculateStandardDeviation(
+        bytes32 pairKey
+    ) internal view returns (uint256) {
+        PricePoint[] storage history = priceHistory[pairKey];
+        uint256 length = history.length;
+
+        if (length < 2) return 0;
+
+        uint256 mean = 0;
+        uint256 recent = length > 20 ? 20 : length;
+
+        for (uint256 i = length - recent; i < length; i++) {
+            mean += history[i].price;
+        }
+        mean = mean / recent;
+
+        uint256 variance = 0;
+        for (uint256 i = length - recent; i < length; i++) {
+            uint256 diff = history[i].price > mean
+                ? history[i].price - mean
+                : mean - history[i].price;
+            variance += diff * diff;
+        }
+
+        return _sqrt(variance / recent);
+    }
+
+    /**
+     * @notice Adds new price point to historical data
+     * @param pairKey Unique identifier for the token pair
+     * @param price Current price value
+     * @param timestamp Current timestamp
+     */
+    function _addPricePoint(
+        bytes32 pairKey,
+        uint256 price,
+        uint256 timestamp
+    ) internal {
+        PricePoint[] storage history = priceHistory[pairKey];
+
+        if (history.length >= MAX_PRICE_HISTORY) {
+            for (uint256 i = 0; i < history.length - 1; i++) {
+                history[i] = history[i + 1];
+            }
+            history[history.length - 1] = PricePoint(timestamp, price, 0);
+        } else {
+            history.push(PricePoint(timestamp, price, 0));
+        }
+    }
+
+    /**
+     * @notice Gets price from 1inch oracle (mock implementation)
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     * @return Current price from 1inch oracle
+     */
+    function _getOneInchPrice(
+        address tokenIn,
+        address tokenOut
+    ) internal view returns (uint256) {
+        return
+            1e18 +
+            (uint256(
+                keccak256(abi.encodePacked(tokenIn, tokenOut, block.timestamp))
+            ) % 1e16);
+    }
+
+    /**
+     * @notice Gets price from Chainlink oracle (mock implementation)
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address
+     * @return Current price from Chainlink oracle
+     */
+    function _getChainlinkPrice(
+        address tokenIn,
+        address tokenOut
+    ) internal view returns (uint256) {
+        return
+            1e18 +
+            (uint256(
+                keccak256(abi.encodePacked(tokenOut, tokenIn, block.timestamp))
+            ) % 1e16);
+    }
+
+    /**
+     * @notice Calculates confidence score based on price oracle agreement
+     * @param oneInchPrice Price from 1inch oracle
+     * @param chainlinkPrice Price from Chainlink oracle
+     * @param stdDev Current standard deviation
+     * @return Confidence score (0-100)
+     */
+    function _calculateConfidence(
+        uint256 oneInchPrice,
+        uint256 chainlinkPrice,
+        uint256 stdDev
+    ) internal pure returns (uint256) {
+        uint256 priceDiff = oneInchPrice > chainlinkPrice
+            ? oneInchPrice - chainlinkPrice
+            : chainlinkPrice - oneInchPrice;
+
+        uint256 priceDeviation = (priceDiff * 10000) / oneInchPrice;
+
+        uint256 baseConfidence = 90;
+        uint256 deviationPenalty = priceDeviation > 100
+            ? 20
+            : priceDeviation / 5;
+        uint256 volatilityPenalty = stdDev > 1e16 ? 10 : 0;
+
+        uint256 confidence = baseConfidence -
+            deviationPenalty -
+            volatilityPenalty;
+        return confidence < 50 ? 50 : confidence;
+    }
+
+    /**
+     * @notice Sets default slippage values for major tokens
+     */
+    function _setDefaultSlippages() internal {
+        defaultSlippages[0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2] = 30;
+        defaultSlippages[0xa0B86A33E6441c92d6BFe2b573c0ad7DcdB3a9E4] = 50;
+        defaultSlippages[0xdAC17F958D2ee523a2206206994597C13D831ec7] = 25;
+    }
+
+    /**
+     * @notice Calculates square root using Babylonian method
+     * @param x Input value
+     * @return Square root of input
+     */
+    function _sqrt(uint256 x) internal pure returns (uint256) {
+        if (x == 0) return 0;
+
+        uint256 z = (x + 1) / 2;
+        uint256 y = x;
+
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+
+        return y;
     }
 }

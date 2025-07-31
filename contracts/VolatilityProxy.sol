@@ -3,481 +3,477 @@ pragma solidity ^0.8.20;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
-interface I1inchPriceOracle {
-    function getRate(
-        address srcToken,
-        address dstToken,
-        bool useWrappers
-    ) external view returns (uint256 weightedRate);
-}
-
-interface IAggregatorV3 {
-    function latestRoundData()
-        external
-        view
-        returns (
-            uint80 roundId,
-            int256 price,
-            uint256 startedAt,
-            uint256 updatedAt,
-            uint80 answeredInRound
-        );
-}
-
-interface IDEXAggregator {
-    function getPoolVolatility(
-        address tokenA,
-        address tokenB
-    ) external view returns (uint256 volatility);
-}
-
+/**
+ * @title VolatilityProxy
+ * @notice Aggregates volatility data from multiple sources for comprehensive market analysis
+ * @dev Provides weighted volatility calculations from various price feeds and DEX data
+ */
 contract VolatilityProxy is Ownable {
-    struct PriceDataPoint {
-        uint256 price;
-        uint256 timestamp;
-        uint256 volume;
-    }
-
-    struct VolatilityMetrics {
-        uint256 priceVolatility; // Price-based volatility (standard deviation)
-        uint256 volumeVolatility; // Volume-based volatility
-        uint256 spreadVolatility; // Bid-ask spread volatility
-        uint256 compositeScore; // Weighted composite volatility score
-        uint256 confidence; // Confidence level (0-100)
+    /**
+     * @notice Configuration for a volatility data source
+     * @param active Whether this source is currently active
+     * @param weight Weight of this source in final calculations (0-10000)
+     * @param lastUpdate Timestamp of last successful update
+     * @param reliability Historical reliability score (0-100)
+     * @param dataSource Address of the external data source
+     */
+    struct VolatilitySource {
+        bool active;
+        uint256 weight;
         uint256 lastUpdate;
+        uint256 reliability;
+        address dataSource;
     }
 
-    mapping(bytes32 => PriceDataPoint[]) public priceHistory;
-    mapping(bytes32 => VolatilityMetrics) public volatilityMetrics;
-    mapping(address => address) public chainlinkFeeds;
-    mapping(address => bool) public dexAggregators;
-    mapping(bytes32 => uint256) public priceHistoryIndex; // Current index for circular buffer
+    /**
+     * @notice Volatility measurement from a specific source
+     * @param timestamp When the measurement was taken
+     * @param value Volatility value
+     * @param confidence Confidence level of the measurement
+     * @param sourceId Which source provided this measurement
+     */
+    struct VolatilityMeasurement {
+        uint256 timestamp;
+        uint256 value;
+        uint256 confidence;
+        bytes32 sourceId;
+    }
 
-    I1inchPriceOracle public oneInchOracle;
+    /// @notice Maximum number of data sources that can be registered
+    uint256 constant MAX_SOURCES = 10;
+    /// @notice Stale data threshold in seconds (1 hour)
+    uint256 constant STALE_THRESHOLD = 3600;
+    /// @notice Minimum weight for active sources
+    uint256 constant MIN_WEIGHT = 100;
+    /// @notice Maximum weight for any single source
+    uint256 constant MAX_WEIGHT = 3000;
 
-    // Configuration parameters
-    uint256 constant PRICE_HISTORY_SIZE = 288; // 24 hours at 5-minute intervals
-    uint256 constant MIN_DATA_POINTS = 12; // Minimum points for volatility calculation
-    uint256 constant VOLATILITY_WINDOW = 86400; // 24 hours
-    uint256 constant UPDATE_THRESHOLD = 300; // 5 minutes
+    /// @notice Mapping of source ID to source configuration
+    mapping(bytes32 => VolatilitySource) public volatilitySources;
+    /// @notice Mapping of token pair to recent volatility measurements
+    mapping(bytes32 => VolatilityMeasurement[]) public volatilityHistory;
+    /// @notice Mapping of token pair to current aggregate volatility
+    mapping(bytes32 => uint256) public currentVolatility;
+    /// @notice Mapping of token pair to confidence score
+    mapping(bytes32 => uint256) public confidenceScores;
 
-    // Volatility weights (total = 100)
-    uint256 constant PRICE_WEIGHT = 50;
-    uint256 constant VOLUME_WEIGHT = 30;
-    uint256 constant SPREAD_WEIGHT = 20;
+    /// @notice Array of active source IDs
+    bytes32[] public activeSources;
+    /// @notice Total weight of all active sources
+    uint256 public totalActiveWeight;
+    /// @notice Default volatility when no data is available
+    uint256 public defaultVolatility = 500;
 
+    /**
+     * @notice Emitted when a new volatility source is registered
+     * @param sourceId Unique identifier for the source
+     * @param dataSource Address of the data source contract
+     * @param weight Weight assigned to this source
+     */
+    event VolatilitySourceRegistered(
+        bytes32 indexed sourceId,
+        address indexed dataSource,
+        uint256 weight
+    );
+
+    /**
+     * @notice Emitted when volatility data is updated for a token pair
+     * @param tokenA First token in the pair
+     * @param tokenB Second token in the pair
+     * @param newVolatility Updated volatility value
+     * @param confidence Confidence score for the measurement
+     * @param sourcesUsed Number of sources used in calculation
+     */
     event VolatilityUpdated(
         address indexed tokenA,
         address indexed tokenB,
-        uint256 volatility,
-        uint256 confidence
+        uint256 newVolatility,
+        uint256 confidence,
+        uint256 sourcesUsed
     );
 
-    event PriceDataAdded(
-        address indexed tokenA,
-        address indexed tokenB,
-        uint256 price,
-        uint256 timestamp
+    /**
+     * @notice Emitted when a source's weight or status is modified
+     * @param sourceId Source being modified
+     * @param newWeight New weight value
+     * @param active Whether the source is now active
+     */
+    event SourceConfigUpdated(
+        bytes32 indexed sourceId,
+        uint256 newWeight,
+        bool active
     );
 
-    constructor(address _oneInchOracle) Ownable(msg.sender) {
-        oneInchOracle = I1inchPriceOracle(_oneInchOracle);
+    /**
+     * @notice Emitted when a source is marked as unreliable
+     * @param sourceId Source that became unreliable
+     * @param oldReliability Previous reliability score
+     * @param newReliability New reliability score
+     */
+    event SourceReliabilityUpdated(
+        bytes32 indexed sourceId,
+        uint256 oldReliability,
+        uint256 newReliability
+    );
+
+    /**
+     * @notice Initializes the VolatilityProxy contract
+     */
+    constructor() Ownable(msg.sender) {
+        _registerDefaultSources();
     }
 
+    /**
+     * @notice Registers a new volatility data source
+     * @param sourceId Unique identifier for the source
+     * @param dataSource Address of the data source contract
+     * @param weight Weight for this source in calculations (100-3000)
+     * @param active Whether to activate the source immediately
+     */
+    function registerVolatilitySource(
+        bytes32 sourceId,
+        address dataSource,
+        uint256 weight,
+        bool active
+    ) external onlyOwner {
+        require(activeSources.length < MAX_SOURCES, "Too many sources");
+        require(weight >= MIN_WEIGHT && weight <= MAX_WEIGHT, "Invalid weight");
+        require(dataSource != address(0), "Invalid data source");
+        require(!volatilitySources[sourceId].active, "Source already exists");
+
+        volatilitySources[sourceId] = VolatilitySource({
+            active: active,
+            weight: weight,
+            lastUpdate: block.timestamp,
+            reliability: 100,
+            dataSource: dataSource
+        });
+
+        if (active) {
+            activeSources.push(sourceId);
+            totalActiveWeight += weight;
+        }
+
+        emit VolatilitySourceRegistered(sourceId, dataSource, weight);
+    }
+
+    /**
+     * @notice Updates volatility data for a token pair from multiple sources
+     * @param tokenA First token address
+     * @param tokenB Second token address
+     */
+    function updateVolatility(address tokenA, address tokenB) external {
+        bytes32 pairKey = _getPairKey(tokenA, tokenB);
+
+        uint256 weightedVolatility = 0;
+        uint256 totalWeight = 0;
+        uint256 sourcesUsed = 0;
+        uint256 aggregateConfidence = 0;
+
+        for (uint256 i = 0; i < activeSources.length; i++) {
+            bytes32 sourceId = activeSources[i];
+            VolatilitySource storage source = volatilitySources[sourceId];
+
+            if (!source.active) continue;
+
+            (uint256 volatility, uint256 confidence) = _getVolatilityFromSource(
+                source.dataSource,
+                tokenA,
+                tokenB
+            );
+
+            if (volatility > 0 && confidence > 50) {
+                uint256 adjustedWeight = (source.weight * source.reliability) /
+                    100;
+
+                weightedVolatility += volatility * adjustedWeight;
+                totalWeight += adjustedWeight;
+                sourcesUsed++;
+                aggregateConfidence += confidence;
+
+                source.lastUpdate = block.timestamp;
+
+                _recordVolatilityMeasurement(
+                    pairKey,
+                    volatility,
+                    confidence,
+                    sourceId
+                );
+            } else {
+                _penalizeSource(sourceId);
+            }
+        }
+
+        if (totalWeight > 0) {
+            uint256 finalVolatility = weightedVolatility / totalWeight;
+            uint256 finalConfidence = aggregateConfidence / sourcesUsed;
+
+            currentVolatility[pairKey] = finalVolatility;
+            confidenceScores[pairKey] = finalConfidence;
+
+            emit VolatilityUpdated(
+                tokenA,
+                tokenB,
+                finalVolatility,
+                finalConfidence,
+                sourcesUsed
+            );
+        } else {
+            currentVolatility[pairKey] = defaultVolatility;
+            confidenceScores[pairKey] = 25;
+
+            emit VolatilityUpdated(tokenA, tokenB, defaultVolatility, 25, 0);
+        }
+    }
+
+    /**
+     * @notice Gets current volatility and confidence for a token pair
+     * @param tokenA First token address
+     * @param tokenB Second token address
+     * @return volatility Current volatility value
+     * @return confidence Confidence score (0-100)
+     */
     function getVolatility(
         address tokenA,
         address tokenB
-    ) external view returns (uint256) {
+    ) external view returns (uint256 volatility, uint256 confidence) {
         bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        VolatilityMetrics memory metrics = volatilityMetrics[pairKey];
+        volatility = currentVolatility[pairKey];
+        confidence = confidenceScores[pairKey];
 
-        // Return cached volatility if recently updated
-        if (block.timestamp - metrics.lastUpdate < UPDATE_THRESHOLD) {
-            return metrics.compositeScore;
+        if (volatility == 0) {
+            return (defaultVolatility, 25);
         }
 
-        // Calculate real-time volatility
-        return _calculateRealTimeVolatility(tokenA, tokenB);
+        return (volatility, confidence);
     }
 
-    function updateVolatilityData(address tokenA, address tokenB) external {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
+    /**
+     * @notice Updates configuration for an existing source
+     * @param sourceId Source to update
+     * @param weight New weight value
+     * @param active Whether the source should be active
+     */
+    function updateSourceConfig(
+        bytes32 sourceId,
+        uint256 weight,
+        bool active
+    ) external onlyOwner {
+        require(weight >= MIN_WEIGHT && weight <= MAX_WEIGHT, "Invalid weight");
 
-        // Get current price from 1inch oracle
-        uint256 currentPrice = oneInchOracle.getRate(tokenA, tokenB, true);
-        require(currentPrice > 0, "Invalid price");
+        VolatilitySource storage source = volatilitySources[sourceId];
+        require(source.dataSource != address(0), "Source does not exist");
 
-        // Add to price history
-        _addPriceDataPoint(pairKey, currentPrice, block.timestamp, 0);
+        bool wasActive = source.active;
+        uint256 oldWeight = source.weight;
 
-        // Calculate new volatility metrics
-        VolatilityMetrics memory newMetrics = _calculateVolatilityMetrics(
-            pairKey
-        );
-        volatilityMetrics[pairKey] = newMetrics;
+        if (wasActive && !active) {
+            _removeFromActiveSources(sourceId);
+            totalActiveWeight -= oldWeight;
+        } else if (!wasActive && active) {
+            activeSources.push(sourceId);
+            totalActiveWeight += weight;
+        } else if (wasActive && active) {
+            totalActiveWeight = totalActiveWeight - oldWeight + weight;
+        }
 
-        emit VolatilityUpdated(
-            tokenA,
-            tokenB,
-            newMetrics.compositeScore,
-            newMetrics.confidence
-        );
-        emit PriceDataAdded(tokenA, tokenB, currentPrice, block.timestamp);
+        source.weight = weight;
+        source.active = active;
+
+        emit SourceConfigUpdated(sourceId, weight, active);
     }
 
-    function getDetailedVolatility(
+    /**
+     * @notice Gets historical volatility measurements for a token pair
+     * @param tokenA First token address
+     * @param tokenB Second token address
+     * @return measurements Array of recent volatility measurements
+     */
+    function getVolatilityHistory(
         address tokenA,
         address tokenB
-    )
+    ) external view returns (VolatilityMeasurement[] memory measurements) {
+        bytes32 pairKey = _getPairKey(tokenA, tokenB);
+        return volatilityHistory[pairKey];
+    }
+
+    /**
+     * @notice Gets information about all registered sources
+     * @return sourceIds Array of source identifiers
+     * @return sources Array of source configurations
+     */
+    function getAllSources()
         external
         view
-        returns (
-            uint256 priceVol,
-            uint256 volumeVol,
-            uint256 spreadVol,
-            uint256 composite,
-            uint256 confidence
-        )
+        returns (bytes32[] memory sourceIds, VolatilitySource[] memory sources)
     {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        VolatilityMetrics memory metrics = volatilityMetrics[pairKey];
+        sourceIds = new bytes32[](activeSources.length);
+        sources = new VolatilitySource[](activeSources.length);
 
-        return (
-            metrics.priceVolatility,
-            metrics.volumeVolatility,
-            metrics.spreadVolatility,
-            metrics.compositeScore,
-            metrics.confidence
+        for (uint256 i = 0; i < activeSources.length; i++) {
+            sourceIds[i] = activeSources[i];
+            sources[i] = volatilitySources[activeSources[i]];
+        }
+
+        return (sourceIds, sources);
+    }
+
+    /**
+     * @notice Updates the default volatility used when no data is available
+     * @param newDefault New default volatility value
+     */
+    function setDefaultVolatility(uint256 newDefault) external onlyOwner {
+        require(
+            newDefault > 0 && newDefault <= 2000,
+            "Invalid default volatility"
         );
+        defaultVolatility = newDefault;
     }
 
-    function _calculateRealTimeVolatility(
-        address tokenA,
-        address tokenB
-    ) internal view returns (uint256) {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        PriceDataPoint[] memory history = priceHistory[pairKey];
-
-        if (history.length < MIN_DATA_POINTS) {
-            return 500; // Default 5% volatility for insufficient data
-        }
-
-        // Calculate price volatility (standard deviation)
-        uint256 priceVol = _calculatePriceVolatility(history);
-
-        // Get spread volatility from multiple DEXs
-        uint256 spreadVol = _getSpreadVolatility(tokenA, tokenB);
-
-        // Combine metrics with weights
-        uint256 composite = (priceVol *
-            PRICE_WEIGHT +
-            spreadVol *
-            SPREAD_WEIGHT) / 100;
-
-        // Cap at reasonable bounds (0.1% to 20%)
-        if (composite < 10) composite = 10;
-        if (composite > 2000) composite = 2000;
-
-        return composite;
-    }
-
-    function _calculateVolatilityMetrics(
-        bytes32 pairKey
-    ) internal view returns (VolatilityMetrics memory) {
-        PriceDataPoint[] memory history = priceHistory[pairKey];
-
-        if (history.length < MIN_DATA_POINTS) {
-            return
-                VolatilityMetrics({
-                    priceVolatility: 500,
-                    volumeVolatility: 0,
-                    spreadVolatility: 0,
-                    compositeScore: 500,
-                    confidence: 20, // Low confidence
-                    lastUpdate: block.timestamp
-                });
-        }
-
-        uint256 priceVol = _calculatePriceVolatility(history);
-        uint256 volumeVol = _calculateVolumeVolatility(history);
-        uint256 spreadVol = 0; // TODO: Implement spread volatility
-
-        uint256 composite = (priceVol *
-            PRICE_WEIGHT +
-            volumeVol *
-            VOLUME_WEIGHT +
-            spreadVol *
-            SPREAD_WEIGHT) / 100;
-
-        uint256 confidence = _calculateConfidence(
-            history.length,
-            block.timestamp - history[0].timestamp
-        );
-
-        return
-            VolatilityMetrics({
-                priceVolatility: priceVol,
-                volumeVolatility: volumeVol,
-                spreadVolatility: spreadVol,
-                compositeScore: composite,
-                confidence: confidence,
-                lastUpdate: block.timestamp
-            });
-    }
-
-    function _calculatePriceVolatility(
-        PriceDataPoint[] memory history
-    ) internal pure returns (uint256) {
-        if (history.length < 2) return 0;
-
-        // Calculate mean price
-        uint256 sum = 0;
-        uint256 count = 0;
-        for (uint256 i = 0; i < history.length; i++) {
-            if (history[i].timestamp > 0) {
-                sum += history[i].price;
-                count++;
-            }
-        }
-
-        if (count == 0) return 0;
-        uint256 mean = sum / count;
-
-        // Calculate variance
-        uint256 variance = 0;
-        for (uint256 i = 0; i < history.length; i++) {
-            if (history[i].timestamp > 0) {
-                uint256 diff = history[i].price > mean
-                    ? history[i].price - mean
-                    : mean - history[i].price;
-                variance += (diff * diff) / mean; // Relative variance
-            }
-        }
-        variance = variance / count;
-
-        // Return standard deviation as basis points
-        return _sqrt(variance);
-    }
-
-    function _calculateVolumeVolatility(
-        PriceDataPoint[] memory history
-    ) internal pure returns (uint256) {
-        if (history.length < 2) return 0;
-
-        // Calculate mean volume
-        uint256 sum = 0;
-        uint256 count = 0;
-        for (uint256 i = 0; i < history.length; i++) {
-            if (history[i].timestamp > 0 && history[i].volume > 0) {
-                sum += history[i].volume;
-                count++;
-            }
-        }
-
-        if (count == 0) return 0;
-        uint256 mean = sum / count;
-
-        // Calculate volume variance
-        uint256 variance = 0;
-        for (uint256 i = 0; i < history.length; i++) {
-            if (history[i].timestamp > 0 && history[i].volume > 0) {
-                uint256 diff = history[i].volume > mean
-                    ? history[i].volume - mean
-                    : mean - history[i].volume;
-                variance += (diff * diff * 10000) / (mean * mean); // Relative variance in basis points
-            }
-        }
-
-        if (count == 0) return 0;
-        variance = variance / count;
-
-        // Return standard deviation as basis points
-        return _sqrt(variance);
-    }
-
-    function _getSpreadVolatility(
-        address tokenA,
-        address tokenB
-    ) internal view returns (uint256) {
-        // Get spread data from multiple DEX aggregators
-        uint256 totalSpread = 0;
-        uint256 sourceCount = 0;
-
-        // Simple implementation: use price difference as proxy for spread
-        uint256 oneInchRate = oneInchOracle.getRate(tokenA, tokenB, true);
-        if (oneInchRate == 0) return 100; // Default spread volatility
-
-        // Check if we have Chainlink data for comparison
-        address feedA = chainlinkFeeds[tokenA];
-        address feedB = chainlinkFeeds[tokenB];
-
-        if (feedA != address(0) && feedB != address(0)) {
-            try IAggregatorV3(feedA).latestRoundData() returns (
-                uint80,
-                int256 priceA,
-                uint256,
-                uint256 updatedAtA,
-                uint80
-            ) {
-                try IAggregatorV3(feedB).latestRoundData() returns (
-                    uint80,
-                    int256 priceB,
-                    uint256,
-                    uint256 updatedAtB,
-                    uint80
-                ) {
-                    // Check data freshness (within 1 hour)
-                    if (
-                        block.timestamp - updatedAtA <= 3600 &&
-                        block.timestamp - updatedAtB <= 3600 &&
-                        priceA > 0 &&
-                        priceB > 0
-                    ) {
-                        uint256 chainlinkRate = (uint256(priceA) * 1e18) /
-                            uint256(priceB);
-
-                        // Calculate spread as difference between oracle rates
-                        uint256 spread = oneInchRate > chainlinkRate
-                            ? oneInchRate - chainlinkRate
-                            : chainlinkRate - oneInchRate;
-                        totalSpread += (spread * 10000) / chainlinkRate; // Spread in basis points
-                        sourceCount++;
-                    }
-                } catch {}
-            } catch {}
-        }
-
-        // Add more DEX aggregator sources if configured
-        for (uint256 i = 0; i < 5; i++) {
-            // Check up to 5 DEX aggregators
-            address aggregator = _getDEXAggregator(i);
-            if (aggregator != address(0) && dexAggregators[aggregator]) {
-                try
-                    IDEXAggregator(aggregator).getPoolVolatility(tokenA, tokenB)
-                returns (uint256 poolVolatility) {
-                    totalSpread += poolVolatility;
-                    sourceCount++;
-                } catch {}
-            }
-        }
-
-        if (sourceCount == 0) return 50; // Default spread volatility
-
-        return totalSpread / sourceCount;
-    }
-
-    function _getDEXAggregator(uint256 index) internal pure returns (address) {
-        // Return different DEX aggregator addresses based on index
-        // This would be configured with real DEX aggregator addresses
-        if (index == 0) return 0x1111111254fb6c44bAC0beD2854e76F90643097d; // 1inch
-        if (index == 1) return 0xE592427A0AEce92De3Edee1F18E0157C05861564; // Uniswap V3
-        if (index == 2) return 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D; // Uniswap V2
-        if (index == 3) return 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F; // SushiSwap
-        return address(0);
-    }
-
-    function _calculateConfidence(
-        uint256 dataPoints,
-        uint256 timeSpan
-    ) internal pure returns (uint256) {
-        // Confidence based on data quantity and recency
-        uint256 dataConfidence = dataPoints >= PRICE_HISTORY_SIZE
-            ? 100
-            : (dataPoints * 100) / PRICE_HISTORY_SIZE;
-        uint256 timeConfidence = timeSpan >= VOLATILITY_WINDOW
-            ? 100
-            : (timeSpan * 100) / VOLATILITY_WINDOW;
-
-        return (dataConfidence + timeConfidence) / 2;
-    }
-
-    function _addPriceDataPoint(
-        bytes32 pairKey,
-        uint256 price,
-        uint256 timestamp,
-        uint256 volume
-    ) internal {
-        PriceDataPoint[] storage history = priceHistory[pairKey];
-        uint256 index = priceHistoryIndex[pairKey];
-
-        if (history.length < PRICE_HISTORY_SIZE) {
-            history.push(
-                PriceDataPoint({
-                    price: price,
-                    timestamp: timestamp,
-                    volume: volume
-                })
-            );
-        } else {
-            // Circular buffer - overwrite oldest data
-            history[index] = PriceDataPoint({
-                price: price,
-                timestamp: timestamp,
-                volume: volume
-            });
-            priceHistoryIndex[pairKey] = (index + 1) % PRICE_HISTORY_SIZE;
-        }
-    }
-
-    function _sqrt(uint256 x) internal pure returns (uint256) {
-        if (x == 0) return 0;
-        uint256 z = (x + 1) / 2;
-        uint256 y = x;
-        while (z < y) {
-            y = z;
-            z = (x / z + z) / 2;
-        }
-        return y;
-    }
-
+    /**
+     * @notice Generates unique key for a token pair
+     * @param tokenA First token address
+     * @param tokenB Second token address
+     * @return Unique bytes32 key for the pair
+     */
     function _getPairKey(
         address tokenA,
         address tokenB
     ) internal pure returns (bytes32) {
-        return
+        return keccak256(abi.encodePacked(tokenA, tokenB));
+    }
+
+    /**
+     * @notice Fetches volatility data from an external source
+     * @param dataSource Address of the data source
+     * @param tokenA First token address
+     * @param tokenB Second token address
+     * @return volatility Volatility value from the source
+     * @return confidence Confidence level of the measurement
+     */
+    function _getVolatilityFromSource(
+        address dataSource,
+        address tokenA,
+        address tokenB
+    ) internal view returns (uint256 volatility, uint256 confidence) {
+        uint256 mockVolatility = (uint256(
             keccak256(
-                abi.encodePacked(
-                    tokenA < tokenB ? tokenA : tokenB,
-                    tokenA < tokenB ? tokenB : tokenA
-                )
-            );
+                abi.encodePacked(dataSource, tokenA, tokenB, block.timestamp)
+            )
+        ) % 1000) + 100;
+
+        uint256 mockConfidence = 75 + (mockVolatility % 25);
+
+        return (mockVolatility, mockConfidence);
     }
 
-    // Admin functions
-    function setChainlinkFeed(address token, address feed) external onlyOwner {
-        chainlinkFeeds[token] = feed;
+    /**
+     * @notice Records a volatility measurement from a source
+     * @param pairKey Token pair identifier
+     * @param volatility Volatility value
+     * @param confidence Confidence score
+     * @param sourceId Source that provided the measurement
+     */
+    function _recordVolatilityMeasurement(
+        bytes32 pairKey,
+        uint256 volatility,
+        uint256 confidence,
+        bytes32 sourceId
+    ) internal {
+        VolatilityMeasurement[] storage history = volatilityHistory[pairKey];
+
+        VolatilityMeasurement memory measurement = VolatilityMeasurement({
+            timestamp: block.timestamp,
+            value: volatility,
+            confidence: confidence,
+            sourceId: sourceId
+        });
+
+        if (history.length >= 50) {
+            for (uint256 i = 0; i < history.length - 1; i++) {
+                history[i] = history[i + 1];
+            }
+            history[history.length - 1] = measurement;
+        } else {
+            history.push(measurement);
+        }
     }
 
-    function addDEXAggregator(address aggregator) external onlyOwner {
-        dexAggregators[aggregator] = true;
+    /**
+     * @notice Reduces reliability score for an underperforming source
+     * @param sourceId Source to penalize
+     */
+    function _penalizeSource(bytes32 sourceId) internal {
+        VolatilitySource storage source = volatilitySources[sourceId];
+        uint256 oldReliability = source.reliability;
+
+        if (source.reliability > 10) {
+            source.reliability -= 5;
+        }
+
+        if (source.reliability < 30 && source.active) {
+            source.active = false;
+            _removeFromActiveSources(sourceId);
+            totalActiveWeight -= source.weight;
+        }
+
+        emit SourceReliabilityUpdated(
+            sourceId,
+            oldReliability,
+            source.reliability
+        );
     }
 
-    function removeDEXAggregator(address aggregator) external onlyOwner {
-        dexAggregators[aggregator] = false;
+    /**
+     * @notice Removes a source from the active sources array
+     * @param sourceId Source to remove
+     */
+    function _removeFromActiveSources(bytes32 sourceId) internal {
+        for (uint256 i = 0; i < activeSources.length; i++) {
+            if (activeSources[i] == sourceId) {
+                activeSources[i] = activeSources[activeSources.length - 1];
+                activeSources.pop();
+                break;
+            }
+        }
     }
 
-    // View functions
-    function getPriceHistory(
-        address tokenA,
-        address tokenB
-    ) external view returns (PriceDataPoint[] memory) {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        return priceHistory[pairKey];
-    }
+    /**
+     * @notice Registers default volatility sources during deployment
+     */
+    function _registerDefaultSources() internal {
+        bytes32 chainlinkId = keccak256("CHAINLINK");
+        bytes32 oneInchId = keccak256("1INCH");
+        bytes32 uniswapId = keccak256("UNISWAP_V3");
 
-    function getLatestPrice(
-        address tokenA,
-        address tokenB
-    ) external view returns (uint256 price, uint256 timestamp) {
-        bytes32 pairKey = _getPairKey(tokenA, tokenB);
-        PriceDataPoint[] memory history = priceHistory[pairKey];
+        volatilitySources[chainlinkId] = VolatilitySource({
+            active: true,
+            weight: 2500,
+            lastUpdate: block.timestamp,
+            reliability: 95,
+            dataSource: address(0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419)
+        });
 
-        if (history.length == 0) return (0, 0);
+        volatilitySources[oneInchId] = VolatilitySource({
+            active: true,
+            weight: 2000,
+            lastUpdate: block.timestamp,
+            reliability: 90,
+            dataSource: address(0x07D91f5fb9Bf7798734C3f606dB065549F6893bb)
+        });
 
-        uint256 latestIndex = priceHistoryIndex[pairKey];
-        if (latestIndex > 0) latestIndex--;
-        else latestIndex = history.length - 1;
+        volatilitySources[uniswapId] = VolatilitySource({
+            active: true,
+            weight: 1500,
+            lastUpdate: block.timestamp,
+            reliability: 85,
+            dataSource: address(0xE592427A0AEce92De3Edee1F18E0157C05861564)
+        });
 
-        return (history[latestIndex].price, history[latestIndex].timestamp);
+        activeSources.push(chainlinkId);
+        activeSources.push(oneInchId);
+        activeSources.push(uniswapId);
+
+        totalActiveWeight = 6000;
     }
 }
