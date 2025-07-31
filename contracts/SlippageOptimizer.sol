@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity ^0.8.20;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
@@ -194,7 +194,6 @@ contract SlippageOptimizer is Ownable {
             fillTime
         );
 
-        // Trigger optimization if enough new data
         if (
             block.timestamp - metrics.lastOptimization > OPTIMIZATION_INTERVAL
         ) {
@@ -209,34 +208,25 @@ contract SlippageOptimizer is Ownable {
         uint256 historicalOptimal,
         uint256 currentVolatility
     ) internal view returns (uint256) {
-        // Gradient descent-inspired optimization
-
-        // Get recent performance data
         PerformanceData[] memory history = performanceHistory[pairKey];
 
-        // Calculate gradient (how slippage changes affect success rate)
         int256 gradient = _calculateGradient(history, volatilityBucket);
 
-        // Get optimizer parameters
         OptimizerParams memory params = tokenOptimizerParams[address(0)]; // Use default
         if (params.learningRate == 0) params = defaultParams;
 
-        // Apply gradient with learning rate
         int256 adjustment = (gradient * int256(params.learningRate)) / 10000;
 
-        // Apply momentum (weighted average with previous optimal)
         uint256 momentum = params.momentumFactor;
         int256 momentumAdjusted = (int256(historicalOptimal) *
             int256(momentum) +
             adjustment *
             int256(10000 - momentum)) / 10000;
 
-        // Apply regularization (bias towards conservative slippage)
         uint256 regularized = uint256(momentumAdjusted) +
             (params.regularization * currentVolatility) /
             10000;
 
-        // Add exploration noise for better optimization
         uint256 exploration = (params.explorationRate * _pseudoRandom()) /
             100000;
 
@@ -247,14 +237,11 @@ contract SlippageOptimizer is Ownable {
         PerformanceData[] memory history,
         uint256 volatilityBucket
     ) internal pure returns (int256 gradient) {
-        // Calculate how success rate changes with slippage for this volatility bucket
-
         uint256 lowSlippageSuccess = 0;
         uint256 lowSlippageTotal = 0;
         uint256 highSlippageSuccess = 0;
         uint256 highSlippageTotal = 0;
 
-        // Define low/high slippage threshold (median of recent data)
         uint256 medianSlippage = _calculateMedianSlippage(
             history,
             volatilityBucket
@@ -274,13 +261,11 @@ contract SlippageOptimizer is Ownable {
 
         if (lowSlippageTotal == 0 || highSlippageTotal == 0) return 0;
 
-        // Calculate success rates
         uint256 lowSuccessRate = (lowSlippageSuccess * 10000) /
             lowSlippageTotal;
         uint256 highSuccessRate = (highSlippageSuccess * 10000) /
             highSlippageTotal;
 
-        // Gradient = change in success rate / change in slippage
         gradient = int256(highSuccessRate) - int256(lowSuccessRate);
 
         return gradient;
@@ -290,7 +275,6 @@ contract SlippageOptimizer is Ownable {
         PerformanceData[] memory history,
         uint256 volatilityBucket
     ) internal pure returns (uint256) {
-        // Simple median calculation for the volatility bucket
         uint256[] memory slippages = new uint256[](history.length);
         uint256 count = 0;
 
@@ -301,9 +285,8 @@ contract SlippageOptimizer is Ownable {
             }
         }
 
-        if (count == 0) return 50; // Default 0.5%
+        if (count == 0) return 50;
 
-        // Simple bubble sort for small arrays
         for (uint256 i = 0; i < count - 1; i++) {
             for (uint256 j = 0; j < count - i - 1; j++) {
                 if (slippages[j] > slippages[j + 1]) {
@@ -359,7 +342,6 @@ contract SlippageOptimizer is Ownable {
         PerformanceData[] storage history = performanceHistory[pairKey];
 
         if (history.length >= HISTORY_LIMIT) {
-            // Remove oldest entry (simple FIFO)
             for (uint256 i = 0; i < history.length - 1; i++) {
                 history[i] = history[i + 1];
             }
@@ -407,12 +389,10 @@ contract SlippageOptimizer is Ownable {
     ) internal view returns (uint256) {
         TokenPairMetrics storage metrics = pairMetrics[pairKey];
 
-        // Base confidence on sample size
         uint256 sampleConfidence = sampleCount >= MIN_SAMPLES * 2
             ? 100
             : (sampleCount * 100) / (MIN_SAMPLES * 2);
 
-        // Adjust for success rate
         uint256 successRate = metrics.totalOrders > 0
             ? (metrics.successfulFills * 100) / metrics.totalOrders
             : 50;
@@ -447,7 +427,6 @@ contract SlippageOptimizer is Ownable {
             );
     }
 
-    // Admin functions
     function setOptimizerParams(
         address token,
         uint256 learningRate,
