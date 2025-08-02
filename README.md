@@ -60,6 +60,10 @@ graph TB
 | **VolatilityProxy.sol**           | Real-time volatility aggregation  | 1inch Oracle, Chainlink feeds, DEX data             |
 | **SlippageOptimizer.sol**         | ML-based performance optimization | Gradient descent learning, confidence scoring       |
 
+### 🔗 Cross-Chain Integration
+
+**Cross-chain functionality is handled by 1inch's built-in cross-chain aggregation, eliminating the need for custom bridge contracts while maintaining security and reliability.**
+
 ### 🔧 Key Technical Innovations
 
 #### 1. **Multi-Source Volatility Calculation**
