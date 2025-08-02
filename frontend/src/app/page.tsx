@@ -83,11 +83,12 @@ export default function Home() {
             Adaptive Cross-Chain Intelligence
           </h2>
           <p className="text-xl text-gray-300 max-w-4xl mx-auto mb-8">
-            The first protocol to intelligently optimize 1inch swaps across
-            blockchain networks. AI-powered slippage optimization with 1inch's
-            aggregation for maximum efficiency.
+            The first protocol to intelligently optimize 1inch cross-chain swaps
+            with AI-powered bridge intelligence. Combines 1inch's cross-chain
+            aggregation with adaptive slippage optimization.
             <span className="block mt-2 text-orange-400 font-semibold">
-              🔥 1inch Integration • 🧠 AI Slippage • ⚡ Cross-Chain Swaps
+              🔥 1inch Cross-Chain • 🧠 AI Bridge Intelligence • ⚡ Single
+              Transaction
             </span>
           </p>
           <div className="flex justify-center items-center space-x-8 mb-8">

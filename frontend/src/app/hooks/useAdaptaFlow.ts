@@ -247,8 +247,8 @@ export function useAdaptaFlow() {
     const [orders, setOrders] = useState<AdaptiveOrder[]>([]);
     const [slippageMetrics, setSlippageMetrics] = useState<SlippageMetrics | null>(null);
 
-    // Get 1inch quote for optimal swap route
-    const get1inchQuote = useCallback(async (
+    // Get 1inch cross-chain quote for optimal swap route
+    const get1inchCrossChainQuote = useCallback(async (
         fromChain: string,
         toChain: string,
         tokenIn: string,
@@ -256,7 +256,52 @@ export function useAdaptaFlow() {
         amount: string
     ) => {
         try {
-            // 1inch API endpoint for quotes
+            const fromChainId = SUPPORTED_CHAINS[fromChain as keyof typeof SUPPORTED_CHAINS]?.chainId;
+            const toChainId = SUPPORTED_CHAINS[toChain as keyof typeof SUPPORTED_CHAINS]?.chainId;
+
+            if (!fromChainId || !toChainId) {
+                throw new Error('Unsupported chains for 1inch cross-chain');
+            }
+
+            const tokenInAddress = getTokenAddress(fromChain, tokenIn);
+            const tokenOutAddress = getTokenAddress(toChain, tokenOut);
+            const amountInWei = parseEther(amount);
+
+            // 1inch cross-chain API call
+            const response = await fetch(
+                `https://api.1inch.dev/swap/v5.2/${fromChainId}/quote?src=${tokenInAddress}&dst=${tokenOutAddress}&amount=${amountInWei.toString()}&fromChainId=${fromChainId}&toChainId=${toChainId}`,
+                {
+                    headers: {
+                        'Authorization': `Bearer ${process.env.NEXT_1INCH_API_KEY}`,
+                        'Accept': 'application/json'
+                    }
+                }
+            );
+
+            if (!response.ok) {
+                throw new Error('1inch cross-chain API error');
+            }
+
+            const quote = await response.json();
+            console.log('🔥 1inch Cross-Chain Quote:', quote);
+
+            return quote;
+        } catch (error) {
+            console.warn('1inch cross-chain API failed, using fallback:', error);
+            // Fallback to same-chain quote
+            return await get1inchSameChainQuote(fromChain, toChain, tokenIn, tokenOut, amount);
+        }
+    }, []);
+
+    // Fallback to same-chain 1inch quote
+    const get1inchSameChainQuote = useCallback(async (
+        fromChain: string,
+        toChain: string,
+        tokenIn: string,
+        tokenOut: string,
+        amount: string
+    ) => {
+        try {
             const chainId = SUPPORTED_CHAINS[fromChain as keyof typeof SUPPORTED_CHAINS]?.chainId;
             if (!chainId) throw new Error('Unsupported chain for 1inch');
 
@@ -264,13 +309,12 @@ export function useAdaptaFlow() {
             const tokenOutAddress = getTokenAddress(toChain, tokenOut);
             const amountInWei = parseEther(amount);
 
-            // 1inch API call
+            // Same-chain 1inch API call
             const response = await fetch(
                 `https://api.1inch.dev/swap/v5.2/${chainId}/quote?src=${tokenInAddress}&dst=${tokenOutAddress}&amount=${amountInWei.toString()}`,
                 {
                     headers: {
-                        'Authorization': `Bearer ${process.env.NEXT_1INCH_API_KEY
-                            }`,
+                        'Authorization': `Bearer ${process.env.NEXT_1INCH_API_KEY}`,
                         'Accept': 'application/json'
                     }
                 }
@@ -281,12 +325,11 @@ export function useAdaptaFlow() {
             }
 
             const quote = await response.json();
-            console.log('🔥 1inch Quote:', quote);
+            console.log('🔥 1inch Same-Chain Quote:', quote);
 
             return quote;
         } catch (error) {
             console.warn('1inch API failed, using fallback:', error);
-            // Fallback to our custom calculation
             return null;
         }
     }, []);
@@ -304,8 +347,8 @@ export function useAdaptaFlow() {
         try {
             setIsLoading(true);
 
-            // Get 1inch quote first
-            const oneInchQuote = await get1inchQuote(fromChain, toChain, tokenIn, tokenOut, amount);
+            // Get 1inch cross-chain quote first
+            const oneInchQuote = await get1inchCrossChainQuote(fromChain, toChain, tokenIn, tokenOut, amount);
 
             // Get cross-chain bridge delay factor
             const bridgeDelayFactor = getBridgeDelayFactor(fromChain, toChain);
@@ -371,7 +414,7 @@ export function useAdaptaFlow() {
         if (!walletClient || !address) throw new Error('Wallet not connected');
 
         try {
-            // 1inch swap API call
+            // 1inch cross-chain swap API call
             const response = await fetch(
                 `https://api.1inch.dev/swap/v5.2/${quote.chainId}/swap`,
                 {
@@ -387,7 +430,10 @@ export function useAdaptaFlow() {
                         from: address,
                         slippage: slippageTolerance,
                         disableEstimate: false,
-                        allowPartialFill: false
+                        allowPartialFill: false,
+                        // Cross-chain parameters
+                        fromChainId: quote.fromChainId,
+                        toChainId: quote.toChainId
                     })
                 }
             );
@@ -421,8 +467,8 @@ export function useAdaptaFlow() {
         try {
             setIsLoading(true);
 
-            // Get 1inch quote first
-            const oneInchQuote = await get1inchQuote(
+            // Get 1inch cross-chain quote first
+            const oneInchQuote = await get1inchCrossChainQuote(
                 formData.fromChain,
                 formData.toChain,
                 formData.fromToken,
